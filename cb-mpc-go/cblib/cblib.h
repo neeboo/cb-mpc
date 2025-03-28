@@ -2,8 +2,8 @@
 
 #include <stdint.h>
 
-#include <cbmpc/core/cmem.h>
-// #include "../../src/cbmpc/core/cmem.h"
+// #include <cbmpc/core/cmem.h>
+#include "../../../src/cbmpc/core/cmem.h"
 
 
 #include "network.h"

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 // include dynamically
 #include <cbmpc/core/cmem.h>
+// #include "../../../src/cbmpc/core/cmem.h"
 
 #ifdef __cplusplus
 extern "C" {
