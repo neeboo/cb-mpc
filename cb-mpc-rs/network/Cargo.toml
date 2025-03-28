@@ -1,0 +1,19 @@
+[package]
+name = "network"
+version = "0.1.0"
+edition = "2021"
+authors = ["neeboo<neeboo@astrox.network>"]
+description = "network"
+
+[lib]
+name = "network"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+bindgen = "0.71.1"  # 或最新版
+cc = "1.2.17"
+
+[dependencies]
+lazy_static = "1.5.0"
+ctor = "0.4.1"
+libc = "0.2"

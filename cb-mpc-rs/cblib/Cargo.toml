@@ -1,0 +1,23 @@
+[package]
+name = "cblib"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Rust implementation of CB MPC library"
+license = "MIT"
+repository = "https://github.com/yourorg/cb-mpc-rs"
+
+[lib]
+name = "cblib"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+network = { path = "../network" }
+
+[build-dependencies]
+bindgen = "0.71"
+
+[features]
+default = []
+ffi = []

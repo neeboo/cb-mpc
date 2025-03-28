@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "cblib",
+    "network"
+]
+
+resolver = "2"
+
+[workspace.dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+bindgen = "0.71"
