@@ -1342,7 +1342,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn getloadavg(__loadavg: *mut f64, __nelem: ::std::os::raw::c_int)
-                      -> ::std::os::raw::c_int;
+        -> ::std::os::raw::c_int;
 }
 pub type send_f = ::std::option::Option<
     unsafe extern "C" fn(

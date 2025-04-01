@@ -408,12 +408,13 @@ pub fn new_ec_key_pairs(count: i32) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), Stri
     Ok((priv_keys, pub_keys))
 }
 
-
-pub fn serialize_ecdsa_shares(keyshares: Vec<MPC_ECDSAMPC_KEY_PTR>) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), String> {
+pub fn serialize_ecdsa_shares(
+    keyshares: Vec<MPC_ECDSAMPC_KEY_PTR>,
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), String> {
     let mut xs = Vec::with_capacity(keyshares.len());
     let mut qs = Vec::with_capacity(keyshares.len());
 
-    for  mut keyshare in keyshares {
+    for mut keyshare in keyshares {
         let mut x_mem = cmem_t {
             data: ptr::null_mut(),
             size: 0,
@@ -426,7 +427,10 @@ pub fn serialize_ecdsa_shares(keyshares: Vec<MPC_ECDSAMPC_KEY_PTR>) -> Result<(V
         let err = unsafe { convert_ecdsa_share_to_bn_t_share(*keyshare, &mut x_mem, &mut q_mem) };
 
         if err != 0 {
-            return Err(format!("Failed to serialize ECDSA shares with error code {}", err));
+            return Err(format!(
+                "Failed to serialize ECDSA shares with error code {}",
+                err
+            ));
         }
 
         xs.push(CMem { inner: x_mem }.to_bytes());

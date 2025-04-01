@@ -1,11 +1,10 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-use std::sync::{Mutex, Arc};
+use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
-use lazy_static::lazy_static;
-
+use std::sync::{Arc, Mutex};
 
 /// Trait for data transport implementations
 pub trait IDataTransport {
@@ -26,12 +25,19 @@ pub fn set_dt_impl(dt_impl: Arc<dyn IDataTransport + Send + Sync>) -> *mut c_voi
 }
 
 fn get_dt_impl(ptr: *mut c_void) -> Arc<dyn IDataTransport + Send + Sync> {
-    DT_IMPL_MAP.lock().unwrap().get(&(ptr as usize)).unwrap().clone()
+    DT_IMPL_MAP
+        .lock()
+        .unwrap()
+        .get(&(ptr as usize))
+        .unwrap()
+        .clone()
 }
 
 pub fn free_dt_impl(ptr: *mut c_void) {
     DT_IMPL_MAP.lock().unwrap().remove(&(ptr as usize));
-    unsafe { Box::from_raw(ptr); }
+    unsafe {
+        Box::from_raw(ptr);
+    }
 }
 
 /// Initialize callbacks
@@ -56,7 +62,10 @@ impl JobSession2P {
     pub fn new(dt_impl: Arc<dyn IDataTransport + Send + Sync>, role_index: i32) -> Self {
         let ptr = set_dt_impl(dt_impl);
         let c_job = unsafe { new_job_session_2p(ptr::null_mut(), ptr, role_index) };
-        Self { dt_impl_ptr: ptr, c_job }
+        Self {
+            dt_impl_ptr: ptr,
+            c_job,
+        }
     }
 
     pub fn is_peer1(&self) -> bool {
@@ -88,11 +97,13 @@ impl JobSession2P {
             unsafe {
                 let mut message_ptr: *mut u8 = ptr::null_mut();
                 let mut message_size: i32 = 0;
-                let result = mpc_2p_receive(self.c_job, sender, &mut message_ptr, &mut message_size);
+                let result =
+                    mpc_2p_receive(self.c_job, sender, &mut message_ptr, &mut message_size);
                 if result != 0 {
                     return Err("2p receive failed".to_string());
                 }
-                let data = Vec::from_raw_parts(message_ptr, message_size as usize, message_size as usize);
+                let data =
+                    Vec::from_raw_parts(message_ptr, message_size as usize, message_size as usize);
                 Ok(data)
             }
         } else {
@@ -120,10 +131,26 @@ pub struct JobSessionMP {
 }
 
 impl JobSessionMP {
-    pub fn new(dt_impl: Arc<dyn IDataTransport + Send + Sync>, party_count: i32, role_index: i32, job_session_id: i32) -> Self {
+    pub fn new(
+        dt_impl: Arc<dyn IDataTransport + Send + Sync>,
+        party_count: i32,
+        role_index: i32,
+        job_session_id: i32,
+    ) -> Self {
         let ptr = set_dt_impl(dt_impl);
-        let c_job = unsafe { new_job_session_mp(ptr::null_mut(), ptr, party_count, role_index, job_session_id) };
-        Self { dt_impl_ptr: ptr, c_job }
+        let c_job = unsafe {
+            new_job_session_mp(
+                ptr::null_mut(),
+                ptr,
+                party_count,
+                role_index,
+                job_session_id,
+            )
+        };
+        Self {
+            dt_impl_ptr: ptr,
+            c_job,
+        }
     }
 
     pub fn is_party(&self, party_index: i32) -> bool {
@@ -162,7 +189,10 @@ pub fn cmem_get(cmem: cmem_t) -> Vec<u8> {
 /// Agree on random value
 pub fn agree_random(job: &JobSession2P, bit_len: i32) -> Result<Vec<u8>, String> {
     unsafe {
-        let mut out = cmem_t { data: ptr::null_mut(), size: 0 };
+        let mut out = cmem_t {
+            data: ptr::null_mut(),
+            size: 0,
+        };
         let result = mpc_agree_random(job.c_job, bit_len, &mut out);
         if result != 0 {
             return Err("mpc_agree_random failed".to_string());

@@ -11,3 +11,10 @@ lib/
 docsgen/
 node_modules/
 
+# rust
+target/
+.DS_Store
+.idea/
+.vscode/
+.devcontainer/
+
