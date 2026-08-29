@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -33,21 +34,50 @@ fn main() {
         .canonicalize()
         .expect("cb-mpc repository root");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let cmake_driver = out_dir.join("cmake-driver");
     let native_build = out_dir.join("native-build");
+    let native_lib_dir = out_dir.join("native-lib");
     let openssl_root = openssl_root();
     let build_type = match env::var("PROFILE").as_deref() {
         Ok("release") | Ok("bench") => "Release",
         _ => "Debug",
     };
 
+    fs::create_dir_all(&cmake_driver).expect("create CMake driver directory in OUT_DIR");
+    fs::create_dir_all(&native_lib_dir).expect("create native library directory in OUT_DIR");
+    fs::write(
+        cmake_driver.join("CMakeLists.txt"),
+        r#"cmake_minimum_required(VERSION 3.16)
+project(CBMPC_RUST_DRIVER LANGUAGES CXX)
+
+if(NOT DEFINED CBMPC_SOURCE_DIR OR NOT DEFINED CBMPC_RUST_ARCHIVE_DIR)
+  message(FATAL_ERROR "CBMPC_SOURCE_DIR and CBMPC_RUST_ARCHIVE_DIR are required")
+endif()
+
+add_subdirectory("${CBMPC_SOURCE_DIR}" cbmpc-source)
+
+set_target_properties(cbmpc PROPERTIES
+  ARCHIVE_OUTPUT_DIRECTORY "${CBMPC_RUST_ARCHIVE_DIR}"
+  ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${CBMPC_RUST_ARCHIVE_DIR}"
+  ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CBMPC_RUST_ARCHIVE_DIR}"
+  ARCHIVE_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CBMPC_RUST_ARCHIVE_DIR}")
+"#,
+    )
+    .expect("write CMake driver in OUT_DIR");
+
     run(
         Command::new("cmake")
             .arg("-S")
-            .arg(&repository_root)
+            .arg(&cmake_driver)
             .arg("-B")
             .arg(&native_build)
             .arg(format!("-DCMAKE_BUILD_TYPE={build_type}"))
             .arg("-DBUILD_TESTS=OFF")
+            .arg(format!("-DCBMPC_SOURCE_DIR={}", repository_root.display()))
+            .arg(format!(
+                "-DCBMPC_RUST_ARCHIVE_DIR={}",
+                native_lib_dir.display()
+            ))
             .arg(format!("-DCBMPC_OPENSSL_ROOT={}", openssl_root.display())),
         "configure Coinbase cb-mpc",
     );
@@ -61,7 +91,6 @@ fn main() {
         "build Coinbase cb-mpc",
     );
 
-    let native_lib_dir = repository_root.join("lib").join(build_type);
     let openssl_lib_dir = if openssl_root.join("lib/libcrypto.a").is_file() {
         openssl_root.join("lib")
     } else {
