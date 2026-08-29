@@ -4,12 +4,12 @@
 #include <variant>
 #include <vector>
 
-#include <cbmpc/crypto/base.h>
-#include <cbmpc/crypto/base_ecc.h>
-#include <cbmpc/crypto/ro.h>
-#include <cbmpc/protocol/ecdsa_2p.h>
-#include <cbmpc/protocol/eddsa.h>
-#include <cbmpc/protocol/mpc_job.h>
+#include <cbmpc/internal/crypto/base.h>
+#include <cbmpc/internal/crypto/base_ecc.h>
+#include <cbmpc/internal/crypto/ro.h>
+#include <cbmpc/internal/protocol/ecdsa_2p.h>
+#include <cbmpc/internal/protocol/eddsa.h>
+#include <cbmpc/internal/protocol/mpc_job.h>
 
 #include "sampler/bn.h"
 #include "sampler/buf.h"
@@ -31,7 +31,7 @@ class test_data_factory_t {
 
  public:
   test_data_factory_t() = default;
-  test_data_factory_t(config_map_t c) : configs(c){};
+  test_data_factory_t(config_map_t c) : configs(c) {};
   ~test_data_factory_t() = default;
   data_map_t generate_one();
   std::vector<data_map_t> generate(int repeats);

@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cbmpc/crypto/base.h>
-#include <cbmpc/protocol/mpc_job_session.h>
+#include <cbmpc/internal/crypto/base.h>
+#include <cbmpc/internal/protocol/mpc_job.h>
 
 #include "channel.h"
 
@@ -18,8 +18,8 @@ struct mpc_net_context_t {
   }
 
   void send(mpc::party_idx_t receiver_role, mem_t msg);
-  error_t receive(mpc::party_idx_t sender_role, mem_t& result);
-  error_t receive_all(const std::vector<mpc::party_idx_t>& senders, std::vector<mem_t>& result);
+  error_t receive(mpc::party_idx_t sender_role, buf_t& result);
+  error_t receive_all(const std::vector<mpc::party_idx_t>& senders, std::vector<buf_t>& result);
 
   void abort();
   void reset();

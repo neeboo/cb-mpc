@@ -1,21 +1,21 @@
 #include "mpc_runner.h"
 
-#include <cbmpc/crypto/base_pki.h>
+#include <cbmpc/internal/crypto/base_pki.h>
 
 using namespace coinbase::mpc;
 
 namespace coinbase::testutils {
 
-error_t local_data_transport_t::send(const party_idx_t receiver, const mem_t& msg) {
+error_t local_data_transport_t::send(const party_idx_t receiver, mem_t msg) {
   net_context_ptr->send(receiver, msg);
   return SUCCESS;
 }
 
-error_t local_data_transport_t::receive(const party_idx_t sender, mem_t& msg) {
+error_t local_data_transport_t::receive(const party_idx_t sender, buf_t& msg) {
   return net_context_ptr->receive(sender, msg);
 }
 
-error_t local_data_transport_t::receive_all(const std::vector<party_idx_t>& senders, std::vector<mem_t>& msgs) {
+error_t local_data_transport_t::receive_all(const std::vector<party_idx_t>& senders, std::vector<buf_t>& msgs) {
   return net_context_ptr->receive_all(senders, msgs);
 }
 
@@ -35,40 +35,37 @@ void mpc_runner_t::init_network(int n_parties) {
 mpc_runner_t::mpc_runner_t(int n_parties) : n(n_parties) {
   if (n == 2) {
     init_network(2);
-    job_2ps[0] = std::make_shared<job_session_2p_t>(party_t::p1, test_pids[0], test_pids[1],
-                                                    std::make_shared<network_t>(get_data_transport_ptr(0)), 0);
-    job_2ps[1] = std::make_shared<job_session_2p_t>(party_t::p2, test_pids[0], test_pids[1],
-                                                    std::make_shared<network_t>(get_data_transport_ptr(1)), 0);
+    job_2ps[0] = std::make_shared<job_2p_t>(party_t::p1, test_pnames[0], test_pnames[1], get_data_transport_ptr(0));
+    job_2ps[1] = std::make_shared<job_2p_t>(party_t::p2, test_pnames[0], test_pnames[1], get_data_transport_ptr(1));
   } else {
     if (n == -2) n = 2;
     init_network(n);
-    std::vector<bn_t> pids(test_pids.begin(), test_pids.begin() + n);
+    std::vector<crypto::pname_t> pnames(test_pnames.begin(), test_pnames.begin() + n);
     for (int i = 0; i < n; i++) {
-      job_mps[i] = std::make_shared<job_session_mp_t>(party_idx_t(i), pids,
-                                                      std::make_shared<network_t>(get_data_transport_ptr(i)), 0);
+      job_mps[i] = std::make_shared<job_mp_t>(party_idx_t(i), pnames, get_data_transport_ptr(i));
     }
   }
 }
 
 void mpc_runner_t::set_new_network_2p() {
-  job_2ps[0]->set_network(party_t::p1, std::make_shared<network_t>(get_data_transport_ptr(0)));
-  job_2ps[1]->set_network(party_t::p2, std::make_shared<network_t>(get_data_transport_ptr(1)));
+  job_2ps[0]->set_transport(party_idx_t(party_t::p1), get_data_transport_ptr(0));
+  job_2ps[1]->set_transport(party_idx_t(party_t::p2), get_data_transport_ptr(1));
 }
 
 void mpc_runner_t::set_new_network_mp() {
   for (int i = 0; i < n; i++) {
-    job_mps[i]->set_network(party_idx_t(i), std::make_shared<network_t>(get_data_transport_ptr(i)));
+    job_mps[i]->set_transport(party_idx_t(i), get_data_transport_ptr(i));
   }
 }
 
-mpc_runner_t::mpc_runner_t(std::shared_ptr<job_session_2p_t> job1, std::shared_ptr<job_session_2p_t> job2) : n(2) {
+mpc_runner_t::mpc_runner_t(std::shared_ptr<job_2p_t> job1, std::shared_ptr<job_2p_t> job2) : n(2) {
   init_network(n);
   job_2ps[0] = job1;
   job_2ps[1] = job2;
   set_new_network_2p();
 }
 
-mpc_runner_t::mpc_runner_t(std::vector<std::shared_ptr<job_session_mp_t>> jobs) : n(jobs.size()) {
+mpc_runner_t::mpc_runner_t(std::vector<std::shared_ptr<job_mp_t>> jobs) : n(jobs.size()) {
   init_network(n);
   for (int i = 0; i < n; i++) {
     job_mps[i] = jobs[i];
@@ -130,80 +127,32 @@ void mpc_runner_t::run_mpc(lambda_mp_t f) {
   run_mpc_role([&](party_idx_t party_index) { f(*job_mps[party_index]); });
 }
 
-void mpc_runner_t::run_2pc_parallel_helper(std::shared_ptr<network_t> network, party_t role, int th_i,
-                                           lambda_2p_parallel_t f) {
-  jsid_t jsid = th_i;
-  job_session_2p_t job(role, test_pids[0], test_pids[1], network, jsid);
-  f(job, th_i);
-}
-
-void mpc_runner_t::run_2pc_parallel(int n_threads, lambda_2p_parallel_t f) {
-  run_mpc_role([&](party_idx_t party_index) {
-    std::shared_ptr<network_t> network = std::make_shared<network_t>(get_data_transport_ptr(party_index), n_threads);
-
-    std::vector<std::thread> threads;
-    for (int th_i = 0; th_i < n_threads; th_i++) {
-      threads.emplace_back(run_2pc_parallel_helper, network, party_t(party_index), th_i, f);
-    }
-    for (auto& th : threads) th.join();
-  });
-}
-
-void mpc_runner_t::run_mpc_parallel_helper(int n, std::shared_ptr<network_t> network, party_idx_t party_index, int th_i,
-                                           lambda_mp_parallel_t f) {
-  jsid_t jsid = th_i;
-  std::vector<crypto::bn_t> pids(test_pids.begin(), test_pids.begin() + n);
-  job_session_mp_t job(party_index, pids, network, jsid);
-  f(job, th_i);
-}
-
-void mpc_runner_t::run_mpc_parallel(int n_threads, lambda_mp_parallel_t f) {
-  run_mpc_role([&](party_idx_t party_index) {
-    std::shared_ptr<network_t> network = std::make_shared<network_t>(get_data_transport_ptr(party_index), n_threads);
-
-    std::vector<std::thread> threads;
-    for (int th_i = 0; th_i < n_threads; th_i++) {
-      threads.emplace_back(run_mpc_parallel_helper, n, network, party_index, th_i, f);
-    }
-    for (auto& th : threads) th.join();
-  });
-}
-
 std::shared_ptr<local_data_transport_t> mpc_runner_t::get_data_transport_ptr(party_idx_t role) {
   return data_transports[role];
 }
 
-const std::vector<crypto::bn_t> mpc_runner_t::test_pids = {
-    crypto::pid_from_name("test party 1"),  crypto::pid_from_name("test party 2"),
-    crypto::pid_from_name("test party 3"),  crypto::pid_from_name("test party 4"),
-    crypto::pid_from_name("test party 5"),  crypto::pid_from_name("test party 6"),
-    crypto::pid_from_name("test party 7"),  crypto::pid_from_name("test party 8"),
-    crypto::pid_from_name("test party 9"),  crypto::pid_from_name("test party 10"),
-    crypto::pid_from_name("test party 11"), crypto::pid_from_name("test party 12"),
-    crypto::pid_from_name("test party 13"), crypto::pid_from_name("test party 14"),
-    crypto::pid_from_name("test party 15"), crypto::pid_from_name("test party 16"),
-    crypto::pid_from_name("test party 17"), crypto::pid_from_name("test party 18"),
-    crypto::pid_from_name("test party 19"), crypto::pid_from_name("test party 20"),
-    crypto::pid_from_name("test party 21"), crypto::pid_from_name("test party 22"),
-    crypto::pid_from_name("test party 23"), crypto::pid_from_name("test party 24"),
-    crypto::pid_from_name("test party 25"), crypto::pid_from_name("test party 26"),
-    crypto::pid_from_name("test party 27"), crypto::pid_from_name("test party 28"),
-    crypto::pid_from_name("test party 29"), crypto::pid_from_name("test party 30"),
-    crypto::pid_from_name("test party 31"), crypto::pid_from_name("test party 32"),
-    crypto::pid_from_name("test party 33"), crypto::pid_from_name("test party 34"),
-    crypto::pid_from_name("test party 35"), crypto::pid_from_name("test party 36"),
-    crypto::pid_from_name("test party 37"), crypto::pid_from_name("test party 38"),
-    crypto::pid_from_name("test party 39"), crypto::pid_from_name("test party 40"),
-    crypto::pid_from_name("test party 41"), crypto::pid_from_name("test party 42"),
-    crypto::pid_from_name("test party 43"), crypto::pid_from_name("test party 44"),
-    crypto::pid_from_name("test party 45"), crypto::pid_from_name("test party 46"),
-    crypto::pid_from_name("test party 47"), crypto::pid_from_name("test party 48"),
-    crypto::pid_from_name("test party 49"), crypto::pid_from_name("test party 50"),
-    crypto::pid_from_name("test party 51"), crypto::pid_from_name("test party 52"),
-    crypto::pid_from_name("test party 53"), crypto::pid_from_name("test party 54"),
-    crypto::pid_from_name("test party 55"), crypto::pid_from_name("test party 56"),
-    crypto::pid_from_name("test party 57"), crypto::pid_from_name("test party 58"),
-    crypto::pid_from_name("test party 59"), crypto::pid_from_name("test party 60"),
-    crypto::pid_from_name("test party 61"), crypto::pid_from_name("test party 62"),
-    crypto::pid_from_name("test party 63"), crypto::pid_from_name("test party 64")};
+const std::vector<crypto::pname_t> mpc_runner_t::test_pnames = {
+    "test party 1",  "test party 2",  "test party 3",  "test party 4",  "test party 5",  "test party 6",
+    "test party 7",  "test party 8",  "test party 9",  "test party 10", "test party 11", "test party 12",
+    "test party 13", "test party 14", "test party 15", "test party 16", "test party 17", "test party 18",
+    "test party 19", "test party 20", "test party 21", "test party 22", "test party 23", "test party 24",
+    "test party 25", "test party 26", "test party 27", "test party 28", "test party 29", "test party 30",
+    "test party 31", "test party 32", "test party 33", "test party 34", "test party 35", "test party 36",
+    "test party 37", "test party 38", "test party 39", "test party 40", "test party 41", "test party 42",
+    "test party 43", "test party 44", "test party 45", "test party 46", "test party 47", "test party 48",
+    "test party 49", "test party 50", "test party 51", "test party 52", "test party 53", "test party 54",
+    "test party 55", "test party 56", "test party 57", "test party 58", "test party 59", "test party 60",
+    "test party 61", "test party 62", "test party 63", "test party 64"};
+
+mpc_runner_t::mpc_runner_t(const std::vector<crypto::pname_t>& pnames) : n(static_cast<int>(pnames.size())) {
+  init_network(n);
+  if (n == 2) {
+    job_2ps[0] = std::make_shared<job_2p_t>(party_t::p1, pnames[0], pnames[1], get_data_transport_ptr(0));
+    job_2ps[1] = std::make_shared<job_2p_t>(party_t::p2, pnames[0], pnames[1], get_data_transport_ptr(1));
+  } else {
+    for (int i = 0; i < n; i++) {
+      job_mps[i] = std::make_shared<job_mp_t>(party_idx_t(i), pnames, get_data_transport_ptr(i));
+    }
+  }
+}
 }  // namespace coinbase::testutils

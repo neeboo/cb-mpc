@@ -1,14 +1,184 @@
+#include <atomic>
 #include <gtest/gtest.h>
+#include <thread>
+#include <vector>
 
-#include <cbmpc/protocol/ecdsa_mp.h>
+#include <cbmpc/internal/core/log.h>
+#include <cbmpc/internal/crypto/elgamal.h>
+#include <cbmpc/internal/protocol/ecdsa_mp.h>
 
 #include "utils/local_network/mpc_tester.h"
+#include "utils/local_network/network_context.h"
 
 namespace {
 
 using namespace coinbase;
 using namespace coinbase::mpc;
 using namespace coinbase::testutils;
+
+static bool tamper_inner_broadcast_elg_com_l_curve_to_null(buf_t& msg) {
+  buf_t pairwise_msg;
+  buf_t broadcast_msg;
+  if (deser(msg, pairwise_msg, broadcast_msg)) return false;
+
+  elg_com_t commitment;
+  if (deser(broadcast_msg, commitment)) return false;
+
+  commitment.L = crypto::ecc_point_t();
+  broadcast_msg = ser(commitment);
+  msg = ser(pairwise_msg, broadcast_msg);
+  return true;
+}
+
+class local_internal_transport_t final : public coinbase::api::data_transport_i {
+ public:
+  explicit local_internal_transport_t(std::shared_ptr<mpc_net_context_t> ctx) : ctx_(std::move(ctx)) {}
+
+  error_t send(coinbase::api::party_idx_t receiver, mem_t msg) override {
+    ctx_->send(receiver, msg);
+    return SUCCESS;
+  }
+
+  error_t receive(coinbase::api::party_idx_t sender, buf_t& msg) override { return ctx_->receive(sender, msg); }
+
+  error_t receive_all(const std::vector<coinbase::api::party_idx_t>& senders, std::vector<buf_t>& msgs) override {
+    std::vector<party_idx_t> internal_senders;
+    internal_senders.reserve(senders.size());
+    for (auto sender : senders) internal_senders.push_back(static_cast<party_idx_t>(sender));
+    return ctx_->receive_all(internal_senders, msgs);
+  }
+
+ private:
+  std::shared_ptr<mpc_net_context_t> ctx_;
+};
+
+class tamper_inner_elg_com_send_transport_t final : public coinbase::api::data_transport_i {
+ public:
+  tamper_inner_elg_com_send_transport_t(std::shared_ptr<mpc_net_context_t> ctx, int tamper_send_index)
+      : ctx_(std::move(ctx)), tamper_send_index_(tamper_send_index) {}
+
+  error_t send(coinbase::api::party_idx_t receiver, mem_t msg) override {
+    buf_t out(msg);
+    if (++send_count_ == tamper_send_index_) {
+      if (!tamper_inner_broadcast_elg_com_l_curve_to_null(out)) return E_GENERAL;
+      tampered_ = true;
+    }
+    ctx_->send(receiver, out);
+    return SUCCESS;
+  }
+
+  error_t receive(coinbase::api::party_idx_t sender, buf_t& msg) override { return ctx_->receive(sender, msg); }
+
+  error_t receive_all(const std::vector<coinbase::api::party_idx_t>& senders, std::vector<buf_t>& msgs) override {
+    std::vector<party_idx_t> internal_senders;
+    internal_senders.reserve(senders.size());
+    for (auto sender : senders) internal_senders.push_back(static_cast<party_idx_t>(sender));
+    return ctx_->receive_all(internal_senders, msgs);
+  }
+
+  bool tampered() const { return tampered_; }
+
+ private:
+  std::shared_ptr<mpc_net_context_t> ctx_;
+  int tamper_send_index_;
+  int send_count_ = 0;
+  bool tampered_ = false;
+};
+
+template <typename F>
+static void run_two_party_mp(const std::vector<std::shared_ptr<mpc_net_context_t>>& peers,
+                             const std::vector<std::shared_ptr<coinbase::api::data_transport_i>>& transports, F&& f,
+                             std::vector<error_t>& out_rv) {
+  for (const auto& peer : peers) peer->reset();
+
+  out_rv.assign(peers.size(), UNINITIALIZED_ERROR);
+  std::atomic<bool> aborted{false};
+  std::vector<std::thread> threads;
+  threads.reserve(peers.size());
+
+  for (size_t i = 0; i < peers.size(); i++) {
+    threads.emplace_back([&, i] {
+      out_rv[i] = f(static_cast<int>(i));
+      if (out_rv[i] && !aborted.exchange(true)) {
+        for (const auto& peer : peers) peer->abort();
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+}
+
+class noop_transport_t final : public coinbase::api::data_transport_i {
+ public:
+  error_t send(coinbase::api::party_idx_t receiver, mem_t msg) override {
+    last_receiver = receiver;
+    last_msg = buf_t(msg);
+    return SUCCESS;
+  }
+
+  error_t receive(coinbase::api::party_idx_t sender, buf_t& msg) override {
+    last_sender = sender;
+    msg = last_msg.empty() ? buf_t("noop") : last_msg;
+    return SUCCESS;
+  }
+
+  error_t receive_all(const std::vector<coinbase::api::party_idx_t>& senders, std::vector<buf_t>& msgs) override {
+    msgs.assign(senders.size(), last_msg.empty() ? buf_t("noop") : last_msg);
+    return SUCCESS;
+  }
+
+  coinbase::api::party_idx_t last_receiver = -1;
+  coinbase::api::party_idx_t last_sender = -1;
+  buf_t last_msg;
+};
+
+TEST(MPCJob, PartySetAndAccessors) {
+  party_set_t empty = party_set_t::empty();
+  EXPECT_TRUE(empty.is_empty());
+  EXPECT_FALSE(empty.has(1));
+
+  party_set_t set = party_set_t::of(1);
+  EXPECT_FALSE(set.is_empty());
+  EXPECT_TRUE(set.has(1));
+  EXPECT_FALSE(set.has(2));
+  set.add(2);
+  EXPECT_TRUE(set.has(2));
+  set.remove(1);
+  EXPECT_FALSE(set.has(1));
+  EXPECT_TRUE(set.has(2));
+
+  noop_transport_t transport;
+  job_mp_t job(1, {"alice", "bob", "carol"}, transport);
+  EXPECT_EQ(job.get_party_idx(), 1);
+  EXPECT_EQ(job.get_n_parties(), 3);
+  EXPECT_EQ(job.get_name(), "bob");
+  EXPECT_EQ(job.get_name(0), "alice");
+  EXPECT_EQ(job.get_names(), (std::vector<crypto::pname_t>{"alice", "bob", "carol"}));
+  EXPECT_EQ(job.get_pid(), crypto::pid_from_name("bob"));
+  EXPECT_EQ(job.get_pid(2), crypto::pid_from_name("carol"));
+  EXPECT_EQ(job.get_pids().size(), 3);
+
+  job.set_transport(2, transport);
+  EXPECT_EQ(job.get_party_idx(), 2);
+  EXPECT_EQ(job.get_name(), "carol");
+
+  dylog_disable_scope_t no_log_err;
+  EXPECT_EQ(job.mpc_abort(E_CRYPTO), E_CRYPTO);
+}
+
+TEST(MPCJob, TwoPartyReferenceTransportAccessors) {
+  noop_transport_t transport;
+  job_2p_t job(party_t::p1, "alice", "bob", transport);
+
+  EXPECT_TRUE(job.is_p1());
+  EXPECT_FALSE(job.is_p2());
+  EXPECT_TRUE(job.is_party(party_t::p1));
+  EXPECT_FALSE(job.is_party(party_t::p2));
+  EXPECT_EQ(job.get_party(), party_t::p1);
+  EXPECT_EQ(job.get_name(), "alice");
+  EXPECT_EQ(job.get_name(party_t::p2), "bob");
+  EXPECT_EQ(job.get_pid(), crypto::pid_from_name("alice"));
+  EXPECT_EQ(job.get_pid(party_t::p2), crypto::pid_from_name("bob"));
+}
 
 TEST_F(Network2PC, BasicMessaging) {
   mpc_runner->run_2pc([](job_2p_t& job) {
@@ -38,31 +208,6 @@ TEST_F(Network2PC, BasicMessaging) {
   });
 }
 
-typedef std::function<void(job_session_2p_t& job)> lambda_2p_t;
-
-TEST_F(Network2PC, ParallelMessaging) {
-  int parallel_count = 50;
-  std::atomic<int> finished(0);
-  std::mutex send_cond_mutex;
-
-  mpc_runner->run_2pc_parallel(parallel_count, [&finished](job_session_2p_t& job, int th_i) {
-    error_t rv = UNINITIALIZED_ERROR;
-    buf_t data;
-    buf_t want(mem_t("test_data:" + std::to_string(th_i * 10000)));
-    if (job.is_p1()) data = want;
-    if (job.is_p2()) EXPECT_NE(data, want);
-
-    rv = job.p1_to_p2(data);
-    ASSERT_EQ(rv, 0);
-
-    EXPECT_EQ(data, want);
-    finished++;
-  });
-
-  // To verify that that all threads finished
-  EXPECT_EQ(finished, parallel_count * 2);
-}
-
 TEST_F(Network4PC, BasicBroadcast) {
   mpc_runner->run_mpc([](job_mp_t& job) {
     error_t rv = UNINITIALIZED_ERROR;
@@ -73,32 +218,57 @@ TEST_F(Network4PC, BasicBroadcast) {
 
     for (int j = 0; j < 4; j++) {
       EXPECT_EQ(data.received(j), buf_t("test_data:" + std::to_string(j)));
-      EXPECT_EQ(data.all_received_refs()[j].get(), buf_t("test_data:" + std::to_string(j)));
-      EXPECT_EQ(data.all_received_values()[j], buf_t("test_data:" + std::to_string(j)));
+      EXPECT_EQ(data.all_received()[j], buf_t("test_data:" + std::to_string(j)));
     }
     EXPECT_EQ(data.msg, buf_t("test_data:" + std::to_string(party_index)));
   });
 }
 
-TEST_F(Network4PC, ParallelBroadcasting) {
-  int parallel_count = 3;
-  std::atomic<int> finished(0);
-
-  mpc_runner->run_mpc_parallel(parallel_count, [&finished](job_mp_t& job, int th_i) {
-    error_t rv = UNINITIALIZED_ERROR;
-    auto party_index = job.get_party_idx();
-    auto data =
-        job.uniform_msg<buf_t>(buf_t("test_data:" + std::to_string(party_index) + "-thread" + std::to_string(th_i)));
-    rv = job.plain_broadcast(data);
-    ASSERT_EQ(rv, 0);
-
-    for (int j = 0; j < 4; j++) {
-      EXPECT_EQ(data.received(j), buf_t("test_data:" + std::to_string(j) + "-thread" + std::to_string(th_i)));
+TEST_F(Network4PC, MessageWrapperCopySafety) {
+  mpc_runner->run_mpc([](job_mp_t& job) {
+    // nonuniform_msg_t copy then use-after-source-destruction should be safe
+    coinbase::buf_t sentinel("x");
+    auto copy_nu = job.nonuniform_msg<coinbase::buf_t>();
+    {
+      auto src = job.nonuniform_msg<coinbase::buf_t>();
+      int n = job.get_n_parties();
+      for (int i = 0; i < n; ++i) src[i] = sentinel;
+      copy_nu = src;  // deep copy
     }
-    finished++;
-  });
+    // Write through received() on the copy; should not crash or UAF
+    for (int i = 0; i < job.get_n_parties(); ++i) {
+      copy_nu.received(i) = sentinel;
+      EXPECT_EQ(copy_nu.received(i), sentinel);
+    }
 
-  EXPECT_EQ(finished, parallel_count * 4);
+    // uniform_msg_t copy then use-after-source-destruction should be safe
+    auto copy_u = job.uniform_msg<coinbase::buf_t>();
+    {
+      auto src = job.uniform_msg<coinbase::buf_t>(coinbase::buf_t("self"));
+      copy_u = src;  // deep copy
+    }
+    for (int i = 0; i < job.get_n_parties(); ++i) {
+      copy_u.received(i) = sentinel;
+      EXPECT_EQ(copy_u.received(i), sentinel);
+    }
+  });
+}
+
+TEST_F(Network4PC, MessageWrapperReallocSafety) {
+  mpc_runner->run_mpc([](job_mp_t& job) {
+    auto w = job.nonuniform_msg<coinbase::buf_t>();
+    auto cap0 = w.msgs.capacity();
+    // Force reallocation of msgs
+    while (w.msgs.capacity() == cap0) {
+      w.msgs.push_back(coinbase::buf_t());
+      if (w.msgs.size() > 1000) break;  // safety guard
+    }
+    // Using received() after reallocation should be safe
+    for (int i = 0; i < job.get_n_parties(); ++i) {
+      w.received(i) = coinbase::buf_t("ok");
+      EXPECT_EQ(w.received(i), coinbase::buf_t("ok"));
+    }
+  });
 }
 
 TEST_P(NetworkMPC, PairwiseAndBroadcast) {
@@ -117,7 +287,7 @@ TEST_P(NetworkMPC, PairwiseAndBroadcast) {
     auto party_index = job.get_party_idx();
     auto data = job.uniform_msg<buf_t>(buf_t("test_data:" + std::to_string(party_index)));
     party_set_t ot_receivers = ecdsampc::ot_receivers_for(party_index, m, ot_role_map);
-    auto ot_msg = job.inplace_msg<buf_t>([&party_index](int j) -> auto{
+    auto ot_msg = job.inplace_msg<buf_t>([&party_index](int j) -> auto {
       return buf_t("test_data:" + std::to_string(party_index) + std::to_string(j));
     });
     rv = ecdsampc::plain_broadcast_and_pairwise_message(job, ot_receivers, ot_msg, data);
@@ -125,8 +295,7 @@ TEST_P(NetworkMPC, PairwiseAndBroadcast) {
 
     for (int j = 0; j < m; j++) {
       EXPECT_EQ(data.received(j), buf_t("test_data:" + std::to_string(j)));
-      EXPECT_EQ(data.all_received_refs()[j].get(), buf_t("test_data:" + std::to_string(j)));
-      EXPECT_EQ(data.all_received_values()[j], buf_t("test_data:" + std::to_string(j)));
+      EXPECT_EQ(data.all_received()[j], buf_t("test_data:" + std::to_string(j)));
 
       if (ot_role_map[j][party_index] == ecdsampc::ot_sender) {
         EXPECT_EQ(ot_msg.received(j), buf_t("test_data:" + std::to_string(j) + std::to_string(party_index)));
@@ -137,65 +306,49 @@ TEST_P(NetworkMPC, PairwiseAndBroadcast) {
     EXPECT_EQ(data.msg, buf_t("test_data:" + std::to_string(party_index)));
   });
 }
-
-TEST_P(NetworkMPC, ParallelBroadcasting) {
-  int n_parties = GetParam();
-  int parallel_count = 16;
-
-  auto mpc_runner = std::make_unique<mpc_runner_t>(n_parties);
-  std::atomic<int> finished(0);
-
-  mpc_runner->run_mpc_parallel(parallel_count, [&finished, &n_parties](job_mp_t& job, int th_i) {
-    error_t rv = UNINITIALIZED_ERROR;
-    auto party_index = job.get_party_idx();
-    auto data =
-        job.uniform_msg<buf_t>(buf_t("test_data:" + std::to_string(party_index) + "-thread" + std::to_string(th_i)));
-    rv = job.plain_broadcast(data);
-    ASSERT_EQ(rv, 0);
-
-    for (int j = 0; j < n_parties; j++) {
-      EXPECT_EQ(data.received(j), buf_t("test_data:" + std::to_string(j) + "-thread" + std::to_string(th_i)));
-    }
-    for (int i = 0; i < 10; i++) {
-      auto data2 =
-          job.uniform_msg<buf_t>(buf_t("test_data:" + std::to_string(party_index) + "-thread" + std::to_string(th_i)));
-      rv = job.plain_broadcast(data2);
-      ASSERT_EQ(rv, 0);
-    }
-    finished++;
-  });
-
-  // To verify that that all threads finished
-  EXPECT_EQ(finished, parallel_count * n_parties);
-}
 INSTANTIATE_TEST_SUITE_P(, NetworkMPC, testing::Values(2, 4, 5, 10, 32, 64));
 
-TEST_F(Network2PC, SequentialThenParallel) {
-  int PARALLEL_COUNT = 3;
-  std::vector<buf_t> data(PARALLEL_COUNT);
-  for (int i = 0; i < data.size(); i++) data[i] = crypto::gen_random_bitlen(128);
+TEST(MPCJob, MultiSetGroupMessageRejectsMalformedInnerBroadcast) {
+  constexpr int n = 2;
+  constexpr int malicious = 1;
 
-  mpc_runner->run_2pc_parallel(1, [&data, PARALLEL_COUNT](job_session_2p_t& job, int dummy) {
-    error_t rv = UNINITIALIZED_ERROR;
-    auto role = job.get_party();
+  std::vector<std::shared_ptr<mpc_net_context_t>> peers;
+  peers.reserve(n);
+  for (int i = 0; i < n; i++) peers.push_back(std::make_shared<mpc_net_context_t>(i));
+  for (const auto& peer : peers) peer->init_with_peers(peers);
 
-    rv = job.p1_to_p2(data[0]);
+  std::vector<std::shared_ptr<coinbase::api::data_transport_i>> transports;
+  transports.push_back(std::make_shared<local_internal_transport_t>(peers[0]));
+  transports.push_back(std::make_shared<tamper_inner_elg_com_send_transport_t>(peers[1], /*tamper_send_index=*/1));
 
-    std::vector<std::thread> threads;
-    job.set_parallel_count(PARALLEL_COUNT);
+  const std::vector<crypto::pname_t> names = {"alice", "bob"};
+  const ecurve_t curve = crypto::curve_secp256k1;
+  const auto [E, _d] = crypto::ec_elgamal_commitment_t::local_keygen(curve);
+  (void)_d;
+  const elg_com_t valid_com = elg_com_t::commit(E, curve.get_random_value()).rand(curve.get_random_value());
 
-    for (int i = 0; i < PARALLEL_COUNT; i++) {
-      threads.emplace_back([&data, &job, PARALLEL_COUNT, i]() {
-        job_session_2p_t parallel_job = job.get_parallel_job(PARALLEL_COUNT, jsid_t(i));
+  std::vector<error_t> results(n, UNINITIALIZED_ERROR);
+  run_two_party_mp(
+      peers, transports,
+      [&](int party_index) {
+        job_mp_t job(party_index, names, *transports[static_cast<size_t>(party_index)]);
 
-        error_t rv = parallel_job.p1_to_p2(data[i]);
-        ASSERT_EQ(rv, 0);
-      });
-    }
-    for (auto& th : threads) th.join();
+        auto pairwise = job.uniform_msg<buf_t>(buf_t("pairwise"));
+        auto broadcast = job.uniform_msg<elg_com_t>(valid_com);
 
-    job.set_parallel_count(0);
-  });
+        party_set_t receivers = party_set_t::of(1);
+        party_set_t senders = party_set_t::of(0);
+        party_set_t all_parties = party_set_t::all();
+
+        dylog_disable_scope_t no_log_err;
+        return job.group_message(std::tie(receivers, senders, pairwise), std::tie(all_parties, all_parties, broadcast));
+      },
+      results);
+
+  auto* tamper_transport = dynamic_cast<tamper_inner_elg_com_send_transport_t*>(transports[1].get());
+  ASSERT_NE(tamper_transport, nullptr);
+  EXPECT_TRUE(tamper_transport->tampered());
+  EXPECT_NE(results[0], SUCCESS);
 }
 
 }  // namespace

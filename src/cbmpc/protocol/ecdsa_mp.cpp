@@ -1,12 +1,12 @@
-#include "ecdsa_mp.h"
+#include <utility>
 
-#include <cbmpc/crypto/ro.h>
-#include <cbmpc/protocol/ot.h>
-#include <cbmpc/protocol/sid.h>
-#include <cbmpc/zk/zk_elgamal_com.h>
-#include <cbmpc/zk/zk_pedersen.h>
-
-#include "util.h"
+#include <cbmpc/internal/crypto/ro.h>
+#include <cbmpc/internal/protocol/ecdsa_mp.h>
+#include <cbmpc/internal/protocol/ot.h>
+#include <cbmpc/internal/protocol/sid.h>
+#include <cbmpc/internal/protocol/util.h>
+#include <cbmpc/internal/zk/zk_elgamal_com.h>
+#include <cbmpc/internal/zk/zk_pedersen.h>
 
 using namespace coinbase::mpc;
 
@@ -16,7 +16,7 @@ namespace coinbase::mpc::ecdsampc {
 #define _ij msgs[j]
 #define _i msg
 #define _j received(j)
-#define _js all_received_refs()
+#define _js all_received()
 
 error_t dkg(job_mp_t& job, ecurve_t curve, key_t& key, buf_t& sid) {
   return eckey::key_share_mp_t::dkg(job, curve, key, sid);
@@ -26,14 +26,46 @@ error_t refresh(job_mp_t& job, buf_t& sid, key_t& key, key_t& new_key) {
   return eckey::key_share_mp_t::refresh(job, sid, key, new_key);
 }
 
+error_t dkg_ac(job_mp_t& job, ecurve_t curve, buf_t& sid, const crypto::ss::ac_t ac,
+               const party_set_t& quorum_party_set, key_t& key) {
+  return eckey::key_share_mp_t::dkg_ac(job, curve, sid, ac, quorum_party_set, key);
+}
+
+error_t refresh_ac(job_mp_t& job, ecurve_t curve, buf_t& sid, const crypto::ss::ac_t ac,
+                   const party_set_t& quorum_party_set, key_t& key, key_t& new_key) {
+  return eckey::key_share_mp_t::refresh_ac(job, curve, sid, ac, quorum_party_set, key, new_key);
+}
+
 error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receiver,
              const std::vector<std::vector<int>>& ot_role_map, buf_t& sig) {
+  sig.free();
   error_t rv = UNINITIALIZED_ERROR;
 
   int peers_count = job.get_n_parties();
   int peer_index = job.get_party_idx();
   int i = peer_index;
   int n = peers_count;
+
+  // Validate ot_role_map dimensions and values up-front to avoid UB / OOB access via operator[].
+  if ((int)ot_role_map.size() != n) return coinbase::error(E_BADARG, "invalid ot_role_map: row count mismatch");
+  for (int r = 0; r < n; r++) {
+    if ((int)ot_role_map[r].size() != n) return coinbase::error(E_BADARG, "invalid ot_role_map: column count mismatch");
+  }
+  for (int r = 0; r < n; r++) {
+    for (int c = 0; c < n; c++) {
+      int role = ot_role_map[r][c];
+      if (r == c) {
+        if (role != ot_no_role) return coinbase::error(E_BADARG, "invalid ot_role_map: diagonal must be ot_no_role");
+        continue;
+      }
+      if (role != ot_sender && role != ot_receiver)
+        return coinbase::error(E_BADARG, "invalid ot_role_map: entries must be ot_sender or ot_receiver");
+      int opp = ot_role_map[c][r];
+      if ((role == ot_sender && opp != ot_receiver) || (role == ot_receiver && opp != ot_sender))
+        return coinbase::error(E_BADARG, "invalid ot_role_map: roles must be anti-symmetric");
+    }
+  }
+
   auto sid_i = job.uniform_msg<buf_t>(crypto::gen_random_bitlen(SEC_P_COM));
 
   ecurve_t curve = key.curve;
@@ -41,7 +73,7 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
   const auto& G = curve.generator();
   int theta = q.get_bits_count() + kappa;
 
-  if (key.x_share * G != key.Qis[i]) return coinbase::error(E_BADARG, "x_share does not match Qi");
+  if (key.x_share * G != key.Qis.at(job.get_name(i))) return coinbase::error(E_BADARG, "x_share does not match Qi");
   if (SUM(key.Qis) != key.Q) return coinbase::error(E_BADARG, "Q does not match the sum of Qis");
   auto h_consistency = job.uniform_msg<buf256_t>();
   h_consistency._i = crypto::sha256_t::hash(msg, key.Q, key.Qis);
@@ -104,7 +136,7 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
   party_set_t ot_senders = ot_senders_for(i, n, ot_role_map);
   party_set_t ot_receivers = ot_receivers_for(i, n, ot_role_map);
 
-  auto ot_msg1 = job.inplace_msg<mpc::ot_protocol_pvw_ctx_t::msg1_t>([&ot](int j) -> auto{ return ot[j].msg1(); });
+  auto ot_msg1 = job.inplace_msg<mpc::ot_protocol_pvw_ctx_t::msg1_t>([&ot](int j) -> auto { return ot[j].msg1(); });
   if (rv = plain_broadcast_and_pairwise_message(job, ot_receivers, ot_msg1, h_gen, Ei_gen, rho, pi_s)) return rv;
 
   // ---------------------- Start of the 2nd round of the signing protocol
@@ -114,10 +146,10 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
     if (i == j) continue;
     if (h_gen._j != h_gen.msg) return coinbase::error(E_CRYPTO);
     if (rv = coinbase::crypto::commitment_t(sid_i._j, job.get_pid(j)).set(rho._j, c._j).open(Ei_gen._j, j)) return rv;
-    // Verifying that Ei_gen values are valid is done in the following verification function
+    if (rv = curve.check(Ei_gen._j)) return coinbase::error(rv, "ecdsa_mp: Ei_gen is not on the session curve");
     if (rv = pi_s._j.verify(Ei_gen._j, sid, peers_count + j)) return rv;
   }
-  const std::vector<ecc_point_t>& E_i = Ei_gen.all_received_values();
+  const std::vector<ecc_point_t>& E_i = Ei_gen.all_received();
   ecc_point_t E = SUM(E_i);
 
   // Proceed with the signing protocol
@@ -134,7 +166,7 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
     if (rv = ot[j].step2_R2S(R_bits_i[j], q.get_bits_count())) return rv;
   }
 
-  auto ot_msg2 = job.inplace_msg<mpc::ot_protocol_pvw_ctx_t::msg2_t>([&ot](int j) -> auto{ return ot[j].msg2(); });
+  auto ot_msg2 = job.inplace_msg<mpc::ot_protocol_pvw_ctx_t::msg2_t>([&ot](int j) -> auto { return ot[j].msg2(); });
   if (rv = plain_broadcast_and_pairwise_message(job, ot_senders, ot_msg2)) return rv;
 
   // ---------------------- Start of the 3rd round of the signing protocol
@@ -178,7 +210,7 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
   }
 
   auto ot_msg3 =
-      job.inplace_msg<mpc::ot_protocol_pvw_ctx_t::msg3_delta_t>([&ot](int j) -> auto{ return ot[j].msg3_delta(); });
+      job.inplace_msg<mpc::ot_protocol_pvw_ctx_t::msg3_delta_t>([&ot](int j) -> auto { return ot[j].msg3_delta(); });
   if (rv = plain_broadcast_and_pairwise_message(job, ot_receivers, ot_msg3, eK_i, eRHO_i, pi_eK, pi_eRHO)) return rv;
 
   // ---------------------- Start of the 4th round of the signing protocol
@@ -196,18 +228,18 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
       for (int t = 0; t < 4; t++) X[l][j][t] = bn_t::from_bin(X_bin[l * 4 + t]);
   }
 
+  // Validate received round-3 broadcast payloads before hashing them into the transcript.
+  for (int j = 0; j < n; j++) {
+    if (i == j) continue;
+    if (rv = pi_eK._j.verify(E, eK_i._j, sid, n_uc_elgamal_com_proofs * j + 0)) return rv;
+    if (rv = pi_eRHO._j.verify(E, eRHO_i._j, sid, n_uc_elgamal_com_proofs * j + 1)) return rv;
+  }
+
   // Initialize the view
   crypto::sha256_t view;
   view.update(E_i, eK_i._js, eRHO_i._js, pi_eK._js, pi_eRHO._js);
 
   // Proceed with message 4 of the signing protocol
-  for (int j = 0; j < n; j++) {
-    if (i == j) continue;
-    // The check for validating eK_i and eRHO_i is done in the verify function
-    if (rv = pi_eK._j.verify(E, eK_i._j, sid, n_uc_elgamal_com_proofs * j + 0)) return rv;
-    if (rv = pi_eRHO._j.verify(E, eRHO_i._j, sid, n_uc_elgamal_com_proofs * j + 1)) return rv;
-  }
-
   auto seed = job.nonuniform_msg<buf256_t>();
   auto v_theta = job.nonuniform_msg<std::array<bn_t, 4>>();
 
@@ -257,6 +289,10 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
     bn_t a[4] = {k_i, rho_i, x_i, rho_i};
 
     std::array<bn_t, 4> v[theta];
+    for (int t = 0; t < 4; t++) {
+      const bn_t& vt = v_theta._j[t];
+      if (!q.is_in_range(vt)) return coinbase::error(E_CRYPTO, "invalid v_theta");
+    }
     v[theta - 1] = v_theta._j;
     crypto::drbg_aes_ctr_t drbg(seed._j);
 
@@ -398,9 +434,7 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
   if (W_eRHO_K != Z_eRHO_K.R) return coinbase::error(E_CRYPTO);
   if (W_eRHO_X != Z_eRHO_X.R) return coinbase::error(E_CRYPTO);
 
-  mem_t data_to_sign = msg;
-  if (data_to_sign.size > curve.size()) data_to_sign.size = curve.size();
-  bn_t m = bn_t::from_bin(data_to_sign);
+  bn_t m = curve_msg_to_bn(msg, curve);
   bn_t r_rho_x, rho_m, r_eR_RHO_X, r_eR_RHO_M, r_eB;
   auto beta = job.uniform_msg<bn_t>();
   MODULO(q) {
@@ -446,9 +480,10 @@ error_t sign(job_mp_t& job, key_t& key, mem_t msg, const party_idx_t sig_receive
 
     bn_t s_reduced = q - s;
     if (s_reduced < s) s = s_reduced;
-    sig = crypto::ecdsa_signature_t(curve, r, s).to_der();
+    buf_t candidate_sig = crypto::ecdsa_signature_t(curve, r, s).to_der();
     crypto::ecc_pub_key_t pub(key.Q);
-    if (rv = pub.verify(msg, sig)) return rv;
+    if (rv = pub.verify(msg, candidate_sig)) return rv;
+    sig = std::move(candidate_sig);
   }
 
   return SUCCESS;

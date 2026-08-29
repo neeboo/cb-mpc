@@ -1,8 +1,6 @@
-#include "zk_paillier.h"
-
-#include <cbmpc/crypto/elgamal.h>
-
-#include "small_primes.h"
+#include <cbmpc/internal/crypto/elgamal.h>
+#include <cbmpc/internal/zk/small_primes.h>
+#include <cbmpc/internal/zk/zk_paillier.h>
 
 namespace coinbase::zk {
 
@@ -13,7 +11,7 @@ void valid_paillier_t::prove(const crypto::paillier_t& paillier, mem_t session_i
 
   bn_t N_inv = mod_t::N_inv_mod_phiN_2048(N, phi_N);
 
-  assert(SEC_P_COM == 128 && "security parameter changed, please update the code");
+  static_assert(SEC_P_COM == 128, "security parameter changed, please update the code");
   buf128_t k = crypto::ro::hash_string(N, session_id, aux).bitlen128();
   crypto::drbg_aes_ctr_t drbg(k);
 
@@ -41,7 +39,7 @@ error_t valid_paillier_t::verify(const crypto::paillier_t& paillier, mem_t sessi
   for (int i = 0; i < param::t; i++) {
     bn_t rho = drbg.gen_bn(N);
     MODULO(N) rho_prod *= rho;
-    if (sigma[i] < 0) return coinbase::error(E_CRYPTO);
+    if (sigma[i] <= 0) return coinbase::error(E_CRYPTO);
     if (sigma[i].pow_mod(N, N) != rho) return coinbase::error(E_CRYPTO);
   }
   if (!mod_t::coprime(rho_prod, N)) return coinbase::error(E_CRYPTO);
@@ -68,6 +66,8 @@ void valid_paillier_interactive_t::valid_paillier_interactive_t::prove(const cry
   crypto::drbg_aes_ctr_t drbg(k);
 
   for (int i = 0; i < param::t; i++) {
+    // Our assumption is that this function is only going to be used with moduli with large primes.
+    // Therefore as stated in the spec we don’t need to do the coprime check.
     bn_t rho = drbg.gen_bn(N);
     prover_msg.sigma[i] = rho.pow_mod(N_inv, N);
   }
@@ -93,7 +93,7 @@ error_t valid_paillier_interactive_t::verify(const crypto::paillier_t& paillier,
     bn_t rho = drbg.gen_bn(N);
     MODULO(N) rho_prod *= rho;
 
-    if (prover_msg.sigma[i] < 0) return coinbase::error(E_CRYPTO);
+    if (prover_msg.sigma[i] <= 0) return coinbase::error(E_CRYPTO);
     if (prover_msg.sigma[i].pow_mod(N, N) != rho) return coinbase::error(E_CRYPTO);
   }
 
@@ -129,7 +129,7 @@ void paillier_zero_t::prove(const crypto::paillier_t& paillier, const bn_t& c, c
           .bitlen(param::padded_log_alpha * param::t);  // use only 13 bits for each ei
 
   for (int i = 0; i < param::t; i++) {
-    bn_t ei = param::get_13_bits(e, i);
+    bn_t ei = param::get_log_alpha_bits(e, i);
     MODULO(N) z[i] = rho[i] * r.pow(ei);
   }
 }
@@ -161,7 +161,7 @@ error_t paillier_zero_t::verify(const crypto::paillier_t& paillier, const bn_t& 
   bn_t z_prod = 1;
   for (int i = 0; i < param::t; i++) {
     MODULO(N) z_prod *= z[i];
-    bn_t ei = param::get_13_bits(e, i);
+    bn_t ei = param::get_log_alpha_bits(e, i);
     MODULO(NN) a[i] = z[i].pow(N) * d.pow(ei);
   }
   if (z_prod == 0 || !mod_t::coprime(z_prod, N)) return coinbase::error(E_CRYPTO);
@@ -169,68 +169,6 @@ error_t paillier_zero_t::verify(const crypto::paillier_t& paillier, const bn_t& 
   buf_t e_tag = crypto::ro::hash_string(N, c, a, session_id, aux)
                     .bitlen(param::padded_log_alpha * param::t);  // use only 13 bits for each ei
   if (e != e_tag) return coinbase::error(E_CRYPTO);
-  return SUCCESS;
-}
-
-void paillier_zero_interactive_t::prover_msg1(const crypto::paillier_t& paillier) {
-  // In our use cases, all our provers have private keys. If not, we would need to verify that gcd(rho_i,N) = 1
-  cb_assert(paillier.has_private_key());
-  const mod_t& N = paillier.get_N();
-  const mod_t& NN = paillier.get_NN();
-  for (int i = 0; i < param::t; i++) {
-    rho[i] = bn_t::rand(N);
-    MODULO(NN) a[i] = rho[i].pow(N);
-  }
-
-  com.id(prover_pid).gen(a);
-}
-
-void paillier_zero_interactive_t::verifier_challenge() {
-  for (int i = 0; i < param::t; i++) {
-    e[i] = crypto::gen_random_int<uint16_t>() & param::alpha_bits_mask;
-  }
-}
-
-void paillier_zero_interactive_t::prover_msg2(const crypto::paillier_t& paillier, const bn_t& r) {
-  const mod_t& N = paillier.get_N();
-  for (int i = 0; i < param::t; i++) {
-    MODULO(N) z[i] = rho[i] * r.pow(e[i] & param::alpha_bits_mask);
-  }
-}
-
-error_t paillier_zero_interactive_t::verify(const crypto::paillier_t& paillier, const bn_t& c) {
-  error_t rv = UNINITIALIZED_ERROR;
-  crypto::vartime_scope_t vartime_scope;
-
-  if (paillier_valid_key == zk_flag::unverified) return coinbase::error(E_CRYPTO);
-
-  const mod_t& N = paillier.get_N();
-  const mod_t& NN = paillier.get_NN();
-
-  if (paillier_no_small_factors == zk_flag::unverified) {
-    if (rv = check_integer_with_small_primes(N, valid_paillier_t::param::alpha)) return rv;
-    paillier_no_small_factors = zk_flag::verified;
-  }
-
-  if (paillier_valid_ciphertext == zk_flag::unverified) {
-    if (rv = paillier.verify_cipher(c)) return rv;
-    paillier_valid_ciphertext = zk_flag::verified;
-  }
-
-  if (rv = com.id(prover_pid).open(a)) return rv;
-
-  bn_t AZ = 1;
-
-  for (int i = 0; i < param::t; i++) {
-    MODULO(NN) {
-      if (z[i].pow(N) != a[i] * c.pow(e[i])) return coinbase::error(E_CRYPTO);
-    }
-
-    MODULO(N) AZ *= a[i] * z[i];
-  }
-
-  if (AZ == 0 || !mod_t::coprime(AZ, N)) return coinbase::error(E_CRYPTO);
-
   return SUCCESS;
 }
 
@@ -270,7 +208,13 @@ void two_paillier_equal_t::prove(const mod_t& q, const crypto::paillier_t& P0, c
           .bitlen(param::t * param::padded_log_alpha);  // only 13 bits are used for each ei
 
   for (int i = 0; i < param::t; i++) {
-    bn_t ei = param::get_13_bits(e, i);
+    bn_t ei = param::get_log_alpha_bits(e, i);
+    // Side-channel note:
+    // - `ei` is public and small (only `param::padded_log_alpha` bits, currently 13) derived from a RO hash.
+    // - `x` is sampled modulo a fixed-size `q` (so its limb-length is effectively fixed for valid inputs).
+    // - The main leak vector for bignum multiplication is operand length (`top`), which is not meaningfully
+    //   data-dependent here in our threat model. If this ever becomes a high-resolution local side-channel
+    //   concern, consider enforcing fixed-top arithmetic for `x` before this multiply.
     d[i] = ei * x + tau[i];
     MODULO(N0) r0_hat[i] = r0.pow(ei) * R0_tilde[i];
     MODULO(N1) r1_hat[i] = r1.pow(ei) * R1_tilde[i];
@@ -285,6 +229,13 @@ error_t two_paillier_equal_t::verify(const mod_t& q, const crypto::paillier_t& P
 
   const mod_t& N0 = P0.get_N();
   const mod_t& N1 = P1.get_N();
+
+  if (bn_t(N0) <= 0) return rv = coinbase::error(E_CRYPTO);
+  if (bn_t(N1) <= 0) return rv = coinbase::error(E_CRYPTO);
+
+  int test_len = q.get_bits_count() + param::log_alpha + SEC_P_STAT + 1;
+  if (N0.get_bits_count() < std::max(crypto::paillier_t::bit_size, test_len)) return rv = coinbase::error(E_CRYPTO);
+  if (N1.get_bits_count() < std::max(crypto::paillier_t::bit_size, test_len)) return rv = coinbase::error(E_CRYPTO);
 
   if (p0_valid_key == zk_flag::unverified) return coinbase::error(E_CRYPTO);
   if (p1_valid_key == zk_flag::unverified) return coinbase::error(E_CRYPTO);
@@ -310,9 +261,6 @@ error_t two_paillier_equal_t::verify(const mod_t& q, const crypto::paillier_t& P
 
   if (bn_t(N0) <= 0) return coinbase::error(E_CRYPTO);
   if (bn_t(N1) <= 0) return coinbase::error(E_CRYPTO);
-  int test_len = q.get_bits_count() + param::log_alpha + SEC_P_STAT + 1;
-  if (N0.get_bits_count() < std::max(2048, test_len)) return coinbase::error(E_CRYPTO);
-  if (N1.get_bits_count() < std::max(2048, test_len)) return coinbase::error(E_CRYPTO);
 
   if (e.size() != coinbase::bits_to_bytes(param::t * param::padded_log_alpha))
     return coinbase::error(E_CRYPTO);  // only 13 bits are used for each ei
@@ -331,7 +279,7 @@ error_t two_paillier_equal_t::verify(const mod_t& q, const crypto::paillier_t& P
   for (int i = 0; i < param::t; i++) {
     if (rv = coinbase::crypto::check_right_open_range(0, d[i], q_with_slack)) return rv;
 
-    bn_t ei = param::get_13_bits(e, i);
+    bn_t ei = param::get_log_alpha_bits(e, i);
 
     if (r0_hat[i] <= 0) return coinbase::error(E_CRYPTO);
     if (r1_hat[i] <= 0) return coinbase::error(E_CRYPTO);
@@ -399,7 +347,9 @@ error_t two_paillier_equal_interactive_t::prover_msg2(const crypto::paillier_t& 
   const mod_t& N1 = P1.get_N();
 
   for (int i = 0; i < param::t; i++) {
-    bn_t ei = param::get_13_bits(challenge_msg.e, i);
+    bn_t ei = param::get_log_alpha_bits(challenge_msg.e, i);
+    // Side-channel note: same rationale as in `two_paillier_equal_t::prove` for `d[i] = ei * x + tau[i]`.
+    // Here `ei` is a public short challenge (13 bits), and `x` is modulo fixed-size `q`.
     msg2.d[i] = ei * x + tau[i];
     MODULO(N0) msg2.r0_hat[i] = r0.pow(ei) * R0_tilde[i];
     MODULO(N1) msg2.r1_hat[i] = r1.pow(ei) * R1_tilde[i];
@@ -422,6 +372,12 @@ error_t two_paillier_equal_interactive_t::verify(const mod_t& q, const crypto::p
 
   const mod_t& NN0 = P0.get_NN();
   const mod_t& NN1 = P1.get_NN();
+
+  if (bn_t(N0) <= 0) return rv = coinbase::error(E_CRYPTO);
+  if (bn_t(N1) <= 0) return rv = coinbase::error(E_CRYPTO);
+  int test_len = q.get_bits_count() + param::log_alpha + SEC_P_STAT + 1;
+  if (N0.get_bits_count() < std::max(crypto::paillier_t::bit_size, test_len)) return rv = coinbase::error(E_CRYPTO);
+  if (N1.get_bits_count() < std::max(crypto::paillier_t::bit_size, test_len)) return rv = coinbase::error(E_CRYPTO);
 
   crypto::commitment_t com(prover_pid);
   if (rv = com.set(msg2.com_rand, msg1.com_msg).open(msg2.c0_tilde, msg2.c1_tilde)) return rv;
@@ -451,12 +407,6 @@ error_t two_paillier_equal_interactive_t::verify(const mod_t& q, const crypto::p
     p1_no_small_factors = zk_flag::verified;
   }
 
-  if (bn_t(N0) <= 0) return coinbase::error(E_CRYPTO);
-  if (bn_t(N1) <= 0) return coinbase::error(E_CRYPTO);
-  int test_len = q.get_bits_count() + param::log_alpha + SEC_P_STAT + 1;
-  if (N0.get_bits_count() < std::max(2048, test_len)) return coinbase::error(E_CRYPTO);
-  if (N1.get_bits_count() < std::max(2048, test_len)) return coinbase::error(E_CRYPTO);
-
   bn_t q_with_slack = q << (param::log_alpha + SEC_P_STAT);
 
   if (coinbase::bits_to_bytes(param::t * param::padded_log_alpha) != e.size())
@@ -471,8 +421,15 @@ error_t two_paillier_equal_interactive_t::verify(const mod_t& q, const crypto::p
 
     MODULO(N0) H0_test *= msg2.r0_hat[i] * msg2.c0_tilde[i];
     MODULO(N1) H1_test *= msg2.r1_hat[i] * msg2.c1_tilde[i];
+  }
 
-    bn_t ei = param::get_13_bits(e, i);
+  if (H0_test == 0) return coinbase::error(E_CRYPTO);
+  if (H1_test == 0) return coinbase::error(E_CRYPTO);
+  if (!mod_t::coprime(H0_test, N0)) return coinbase::error(E_CRYPTO);
+  if (!mod_t::coprime(H1_test, N1)) return coinbase::error(E_CRYPTO);
+
+  for (int i = 0; i < param::t; i++) {
+    bn_t ei = param::get_log_alpha_bits(e, i);
     bn_t t0, t1;
     MODULO(NN0) t0 = c0.pow(ei) * msg2.c0_tilde[i];
     MODULO(NN1) t1 = c1.pow(ei) * msg2.c1_tilde[i];
@@ -480,11 +437,6 @@ error_t two_paillier_equal_interactive_t::verify(const mod_t& q, const crypto::p
     if (t0 != P0.encrypt(msg2.d[i], msg2.r0_hat[i])) return coinbase::error(E_CRYPTO);
     if (t1 != P1.encrypt(msg2.d[i], msg2.r1_hat[i])) return coinbase::error(E_CRYPTO);
   }
-
-  if (H0_test == 0) return coinbase::error(E_CRYPTO);
-  if (H1_test == 0) return coinbase::error(E_CRYPTO);
-  if (!mod_t::coprime(H0_test, N0)) return coinbase::error(E_CRYPTO);
-  if (!mod_t::coprime(H1_test, N1)) return coinbase::error(E_CRYPTO);
 
   c1_plaintext_range = zk_flag::verified;
   return SUCCESS;
@@ -512,6 +464,9 @@ void pdl_t::prove(const bn_t& c_key, const crypto::paillier_t& paillier, const e
   R = r_mod_q * G;
 
   bn_t e = crypto::ro::hash_number(c_key, N, Q1, c_r, R, sid, aux).mod(q);
+  // Side-channel note:
+  // `e` is a public RO-derived challenge. The arithmetic `e * x1` uses bignum ops; for valid inputs `x1` is modulo
+  // fixed-size `q`, so operand limb-length is effectively fixed (the dominant timing driver in typical BN code).
   z = r + e * x1;
   MODULO(N) r_z = r_rand * r_key.pow_mod(e, N);
 
@@ -528,8 +483,15 @@ error_t pdl_t::verify(const bn_t& c_key, const crypto::paillier_t& paillier, con
 
   const mod_t& N = paillier.get_N();
   ecurve_t curve = Q1.get_curve();
+  if (!curve) return coinbase::error(E_CRYPTO, "pdl_t::verify: Q1 curve is null");
   const mod_t& q = curve.order();
   const auto& G = curve.generator();
+
+  if (rv = curve.check(Q1)) return coinbase::error(rv, "pdl_t::verify: Q1 is not a valid curve point");
+  {
+    crypto::allow_ecc_infinity_t allow_infinity;
+    if (rv = curve.check(R)) return coinbase::error(rv, "pdl_t::verify: R is not a valid curve point");
+  }
 
   bn_t e = crypto::ro::hash_number(c_key, N, Q1, c_r, R, sid, aux).mod(q);
 
@@ -544,7 +506,7 @@ error_t pdl_t::verify(const bn_t& c_key, const crypto::paillier_t& paillier, con
   }
 
   bn_t qq = q * q;
-  if (N.get_bits_count() < 2048 || N < ((qq << (SEC_P_STAT + 1)) + (qq << 1))) return coinbase::error(E_CRYPTO);
+  if (N.get_bits_count() < 2048 || N <= ((qq << (SEC_P_STAT + 1)) + (qq << 1))) return coinbase::error(E_CRYPTO);
 
   const mod_t& NN = paillier.get_NN();
   if (rv = coinbase::crypto::check_open_range(0, c_r, NN)) return rv;
@@ -555,7 +517,7 @@ error_t pdl_t::verify(const bn_t& c_key, const crypto::paillier_t& paillier, con
 
   if (z * G != R + e * Q1) return coinbase::error(E_CRYPTO);
 
-  if (z >= (qq + 1) << SEC_P_STAT) return coinbase::error(E_CRYPTO);
+  if (rv = coinbase::crypto::check_right_open_range(0, z, (qq + 1) << SEC_P_STAT)) return rv;
 
   crypto::paillier_t::elem_t c_z = paillier.elem(c_r) + (paillier.elem(c_key) * e);
   if (paillier.encrypt(z, r_z) != c_z.to_bn()) return coinbase::error(E_CRYPTO);

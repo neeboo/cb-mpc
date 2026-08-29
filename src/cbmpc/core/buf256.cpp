@@ -1,4 +1,4 @@
-#include <cbmpc/core/convert.h>
+#include <cbmpc/internal/core/convert.h>
 
 namespace coinbase {
 
@@ -6,6 +6,8 @@ buf256_t& buf256_t::operator=(mem_t src) {
   cb_assert(src.size == sizeof(buf256_t));
   return *this = load(src.data);
 }
+
+buf256_t::operator mem_t() const { return mem_t(byte_ptr(this), sizeof(buf256_t)); }
 
 buf256_t& buf256_t::operator=(const buf_t& src) {
   cb_assert(src.size() == sizeof(buf256_t));
@@ -45,25 +47,22 @@ void buf256_t::save(byte_ptr dst) const {
 }
 
 bool buf256_t::get_bit(int index) const {
-  int n = index / 64;
-  index %= 64;
-  return ((((const uint64_t*)(this))[n] >> index) & 1) != 0;
+  cb_assert(index >= 0 && index < 256);
+  if (index < 128) return lo.get_bit(index);
+  return hi.get_bit(index - 128);
 }
 
 void buf256_t::set_bit(int index, bool value) {
-  int n = index / 64;
-  index %= 64;
-  uint64_t mask = uint64_t(1) << index;
-
-  if (value)
-    ((uint64_t*)(this))[n] |= mask;
+  cb_assert(index >= 0 && index < 256);
+  if (index < 128)
+    lo.set_bit(index, value);
   else
-    ((uint64_t*)(this))[n] &= ~mask;
+    hi.set_bit(index - 128, value);
 }
 
-bool buf256_t::operator==(const buf256_t& src) const { return (src.lo == lo) && (src.hi == hi); }
+bool buf256_t::operator==(const buf256_t& src) const { return ((src.lo ^ lo) | (src.hi ^ hi)) == ZERO128; }
 
-bool buf256_t::operator!=(const buf256_t& src) const { return (src.lo != lo) || (src.hi != hi); }
+bool buf256_t::operator!=(const buf256_t& src) const { return ((src.lo ^ lo) | (src.hi ^ hi)) != ZERO128; }
 
 buf256_t buf256_t::operator~() const {
   buf256_t dst{};
@@ -124,15 +123,6 @@ buf256_t& buf256_t::operator&=(bool src) {
   return *this;
 }
 
-void buf256_t::be_inc() {
-  byte_ptr p = byte_ptr(this) + 32;
-  for (int i = 0; i < 32; i++) {
-    byte_t x = *--p;
-    *p = ++x;
-    if (x) break;
-  }
-}
-
 buf256_t buf256_t::reverse_bytes() const {
   buf256_t out{};
   byte_ptr dst = byte_ptr(&out);
@@ -155,6 +145,8 @@ void buf256_t::convert(coinbase::converter_t& converter) {
 }
 
 buf256_t buf256_t::operator<<(unsigned n) const {
+  cb_assert(n < 256);
+  if (n == 0) return *this;
   buf128_t l = lo;
   buf128_t r = hi;
   if (n == 128) {
@@ -172,9 +164,11 @@ buf256_t buf256_t::operator<<(unsigned n) const {
 }
 
 buf256_t buf256_t::operator>>(unsigned n) const {
+  cb_assert(n < 256);
+  if (n == 0) return *this;
   buf128_t l = lo;
   buf128_t r = hi;
-  if (n == 64) {
+  if (n == 128) {
     l = r;
     r = ZERO128;
   } else if (n > 128) {
@@ -241,7 +235,7 @@ buf256_t::caryless_mul(buf128_t a, buf128_t b) {
   buf256_t m = buf256_t::make(a, ZERO128);
 
   for (int i = 0; i < 128; i++) {
-    if (b.get_bit(i)) r ^= m;
+    r ^= m & b.get_bit(i);
     m <<= 1;
   }
 
@@ -249,70 +243,4 @@ buf256_t::caryless_mul(buf128_t a, buf128_t b) {
 #endif
 }
 
-buf128_t buf256_t::binary_galois_field_reduce(buf256_t x) {
-  buf128_t res{};
-
-#ifdef __x86_64__
-  __m128i tmp2, tmp3, tmp4, tmp5, tmp6, tmp7, tmp8, tmp9;
-  tmp3 = x.lo.value;
-  tmp6 = x.hi.value;
-
-  tmp7 = _mm_srli_epi32(tmp3, 31);
-  tmp8 = _mm_srli_epi32(tmp6, 31);
-  tmp3 = _mm_slli_epi32(tmp3, 1);
-  tmp6 = _mm_slli_epi32(tmp6, 1);
-  tmp9 = _mm_srli_si128(tmp7, 12);
-  tmp8 = _mm_slli_si128(tmp8, 4);
-  tmp7 = _mm_slli_si128(tmp7, 4);
-  tmp3 = _mm_or_si128(tmp3, tmp7);
-  tmp6 = _mm_or_si128(tmp6, tmp8);
-  tmp6 = _mm_or_si128(tmp6, tmp9);
-  tmp7 = _mm_slli_epi32(tmp3, 31);
-  tmp8 = _mm_slli_epi32(tmp3, 30);
-  tmp9 = _mm_slli_epi32(tmp3, 25);
-  tmp7 = _mm_xor_si128(tmp7, tmp8);
-  tmp7 = _mm_xor_si128(tmp7, tmp9);
-  tmp8 = _mm_srli_si128(tmp7, 4);
-  tmp7 = _mm_slli_si128(tmp7, 12);
-  tmp3 = _mm_xor_si128(tmp3, tmp7);
-  tmp2 = _mm_srli_epi32(tmp3, 1);
-  tmp4 = _mm_srli_epi32(tmp3, 2);
-  tmp5 = _mm_srli_epi32(tmp3, 7);
-  tmp2 = _mm_xor_si128(tmp2, tmp4);
-  tmp2 = _mm_xor_si128(tmp2, tmp5);
-  tmp2 = _mm_xor_si128(tmp2, tmp8);
-  tmp3 = _mm_xor_si128(tmp3, tmp2);
-  tmp6 = _mm_xor_si128(tmp6, tmp3);
-  res.value = tmp6;
-
-#else
-
-  x <<= 1;
-
-  uint64_t x0 = x.lo.lo();
-  uint64_t x1 = x.lo.hi();
-  uint64_t x2 = x.hi.lo();
-  uint64_t x3 = x.hi.hi();
-
-  uint64_t a = x0 << 63;
-  uint64_t b = x0 << 62;
-  uint64_t c = x0 << 57;
-  uint64_t d = x1 ^ a ^ b ^ c;
-  buf128_t temp = buf128_t::make(x0, d);
-  temp >>= 1;
-  uint64_t e0 = temp.lo();
-  uint64_t e1 = temp.hi();
-  temp >>= 1;
-  uint64_t f0 = temp.lo();
-  uint64_t f1 = temp.hi();
-  temp >>= 5;
-  uint64_t g0 = temp.lo();
-  uint64_t g1 = temp.hi();
-
-  uint64_t h0 = x0 ^ e0 ^ f0 ^ g0;
-  uint64_t h1 = d ^ e1 ^ f1 ^ g1;
-  res = buf128_t::make(x2 ^ h0, x3 ^ h1);
-#endif
-  return res;
-}
 }  // namespace coinbase

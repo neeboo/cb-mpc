@@ -1,9 +1,9 @@
-#include "convert.h"
+#include <cbmpc/internal/core/convert.h>
 
 namespace coinbase {
 
 void converter_t::convert(bool& value) {
-  uint8_t v = value ? 1 : 0;
+  uint8_t v = (write && value) ? 1 : 0;
   convert(v);
   if (!is_error() && !write) value = v != 0;
 }
@@ -94,7 +94,7 @@ void converter_t::convert(std::string& value) {
   convert(value_size);
 
   if (write) {
-    if (pointer) memmove(current(), &value[0], value_size);
+    if (pointer) memmove(current(), value.data(), value_size);
   } else {
     if (value_size < 0) {
       set_error();
@@ -106,7 +106,7 @@ void converter_t::convert(std::string& value) {
       return;
     }
     value.resize(value_size);
-    memmove(&value[0], current(), value_size);
+    memmove(value.data(), current(), value_size);
   }
   forward(value_size);
 }
@@ -115,9 +115,8 @@ converter_t::converter_t(bool _write) : write(_write), rv_error(0), pointer(null
 
 converter_t::converter_t(byte_ptr out) : write(true), rv_error(0), pointer(out), offset(0), size(0) {}
 
-converter_t::converter_t(mem_t src) : write(false), rv_error(0), pointer(src.data), offset(0), size(src.size) {}
-
-converter_t::converter_t(cmembig_t src) : write(false), rv_error(0), pointer(src.data), offset(0), size(src.size) {}
+converter_t::converter_t(mem_t src)
+    : write(false), rv_error(0), pointer(const_cast<byte_ptr>(src.data)), offset(0), size(src.size) {}
 
 void converter_t::set_error() {
   if (rv_error) return;
@@ -132,7 +131,7 @@ void converter_t::set_error(error_t rv) {
 void converter_t::convert_len(uint32_t& len) {
   byte_t b = 0;
   if (write) {
-    cb_assert(len <= 0x1fffffff);
+    cb_assert(len <= MAX_CONVERT_LEN);
     if (len <= 0x7f) {
       b = byte_t(len);
       convert(b);
@@ -170,13 +169,22 @@ void converter_t::convert_len(uint32_t& len) {
     }
     if ((b & 0x80) == 0) {
       len = b;
+      if (len > MAX_CONVERT_LEN) {
+        set_error();
+        len = 0;
+      }
       return;
     }
     if ((b & 0x40) == 0) {
       len = b & 0x3f;
       convert(b);
       len = (len << 8) | b;
-      if (is_error()) len = 0;
+      if (is_error())
+        len = 0;
+      else if (len > MAX_CONVERT_LEN) {
+        set_error();
+        len = 0;
+      }
       return;
     }
     if ((b & 0x20) == 0) {
@@ -185,7 +193,12 @@ void converter_t::convert_len(uint32_t& len) {
       len = (len << 8) | b;
       convert(b);
       len = (len << 8) | b;
-      if (is_error()) len = 0;
+      if (is_error())
+        len = 0;
+      else if (len > MAX_CONVERT_LEN) {
+        set_error();
+        len = 0;
+      }
       return;
     }
     len = b & 0x1f;
@@ -195,7 +208,12 @@ void converter_t::convert_len(uint32_t& len) {
     len = (len << 8) | b;
     convert(b);
     len = (len << 8) | b;
-    if (is_error()) len = 0;
+    if (is_error())
+      len = 0;
+    else if (len > MAX_CONVERT_LEN) {
+      set_error();
+      len = 0;
+    }
   }
 }
 
@@ -205,40 +223,18 @@ void converter_t::convert(std::vector<bool>& value) {
   short count = (short)value.size();
   convert(count);
 
-  if (!write) value.resize(count);
+  if (!write) {
+    if (count < 0 || static_cast<uint32_t>(count) > MAX_CONTAINER_ELEMENTS) {
+      set_error();
+      return;
+    }
+    value.resize(count);
+  }
   for (short i = 0; i < count && !is_error(); i++) {
     bool v = value[i];
     convert(v);
     value[i] = v;
   }
-}
-
-void convertable_t::factory_t::register_type(def_t* def, uint64_t code_type) {
-  g_convertable_factory.instance().map[code_type] = def;
-}
-
-convertable_t* convertable_t::factory_t::create(uint64_t code_type) {
-  const auto& map = g_convertable_factory.instance().map;
-  const auto i = map.find(code_type);
-  if (i == map.end()) return nullptr;
-  return i->second->create();
-}
-
-convertable_t* convertable_t::factory_t::create(mem_t mem, bool convert) {
-  if (mem.size < sizeof(uint64_t)) return nullptr;
-
-  uint64_t code_type = be_get_8(mem.data);
-  convertable_t* obj = create(code_type);
-  if (!convert) return obj;
-
-  if (!obj) return nullptr;
-
-  converter_t converter(mem);
-  obj->convert(converter);
-  if (!converter.is_error()) return obj;
-
-  delete obj;
-  return nullptr;
 }
 
 uint64_t converter_t::convert_code_type(uint64_t code, uint64_t code2, uint64_t code3, uint64_t code4, uint64_t code5,

@@ -1,8 +1,12 @@
 #include <gtest/gtest.h>
 
-#include <cbmpc/crypto/lagrange.h>
-#include <cbmpc/crypto/secret_sharing.h>
-#include <cbmpc/protocol/ecdsa_mp.h>
+#include <cbmpc/internal/core/log.h>
+#include <cbmpc/internal/crypto/commitment.h>
+#include <cbmpc/internal/crypto/lagrange.h>
+#include <cbmpc/internal/crypto/secret_sharing.h>
+#include <cbmpc/internal/protocol/ecdsa_mp.h>
+#include <cbmpc/internal/zk/zk_ec.h>
+#include <cbmpc/internal/zk/zk_elgamal_com.h>
 
 #include "utils/local_network/mpc_tester.h"
 #include "utils/test_macros.h"
@@ -33,6 +37,38 @@ class ECDSA4PC : public Network4PC {
   }
 };
 
+error_t broadcast_foreign_curve_dkg_share(job_mp_t& job, ecurve_t session_curve, ecurve_t proof_curve) {
+  error_t rv = UNINITIALIZED_ERROR;
+  const int n = job.get_n_parties();
+  const int i = job.get_party_idx();
+
+  auto h_consistency = job.uniform_msg<buf256_t>();
+  h_consistency.msg = crypto::sha256_t::hash(std::string(session_curve.get_name()));
+
+  auto sid_i = job.uniform_msg<buf_t>(crypto::gen_random_bitlen(SEC_P_COM));
+  const bn_t x = bn_t::rand(proof_curve.order());
+  auto Qi = job.uniform_msg<ecc_point_t>(x * proof_curve.generator());
+
+  crypto::commitment_t com(sid_i, job.get_pid(i));
+  com.gen(Qi.msg);
+  auto c = job.uniform_msg<buf_t>(com.msg);
+  if (rv = job.plain_broadcast(sid_i, c, h_consistency)) return rv;
+
+  for (int j = 0; j < n; j++) {
+    if (j == i) continue;
+    if (h_consistency.received(j) != h_consistency) return coinbase::error(E_CRYPTO);
+  }
+
+  const buf_t sid = crypto::sha256_t::hash(sid_i.all_received());
+  auto h = job.uniform_msg<buf256_t>(crypto::sha256_t::hash(c.all_received()));
+  auto pi = job.uniform_msg<zk::uc_dl_t>();
+  pi.prove(Qi, x, sid, i);
+
+  auto rho = job.uniform_msg<buf256_t>(com.rand);
+  auto sid_msg = job.uniform_msg<buf_t>(sid);
+  return job.plain_broadcast(sid_msg, h, Qi, rho, pi);
+}
+
 std::vector<std::vector<int>> test_ot_role(int n) {
   std::vector<std::vector<int>> ot_role_map(n, std::vector<int>(n));
   for (int i = 0; i < n; i++) {
@@ -48,7 +84,110 @@ std::vector<std::vector<int>> test_ot_role(int n) {
   return ot_role_map;
 }
 
+class mutate_ecdsa_verification_key_job_t final : public job_mp_t {
+ public:
+  mutate_ecdsa_verification_key_job_t(party_idx_t index, const std::vector<crypto::pname_t>& pnames,
+                                      ecdsampc::key_t& key)
+      : job_mp_t(index, pnames), key_(key) {}
+
+  void arm() { armed_ = true; }
+  bool mutated() const { return mutated_; }
+
+  error_t receive_many_impl(std::vector<party_idx_t> from_set, std::vector<buf_t>& outs) override {
+    error_t rv = job_mp_t::receive_many_impl(from_set, outs);
+    if (rv || !armed_ || mutated_ || outs.empty()) return rv;
+
+    for (const auto& out : outs) {
+      bn_t rho_k;
+      zk::elgamal_com_pub_share_equ_t pi_rho_k;
+      bn_t beta;
+      zk::elgamal_com_pub_share_equ_t pi_beta;
+      dylog_disable_scope_t no_log_err;
+      if (coinbase::deser(out, rho_k, pi_rho_k, beta, pi_beta)) return SUCCESS;
+    }
+
+    // The final signing shares and proofs have been received. Changing Q now
+    // affects only the final signature verification.
+    key_.Q += key_.curve.generator();
+    mutated_ = true;
+    return SUCCESS;
+  }
+
+ private:
+  ecdsampc::key_t& key_;
+  bool armed_ = false;
+  bool mutated_ = false;
+};
+
 class ECDSAMPC : public NetworkMPC {};
+
+TEST_F(ECDSA4PC, RejectsForeignCurveDkgShareGracefully) {
+  constexpr int malicious_index = 1;
+  std::vector<ecdsampc::key_t> keys(4);
+  std::vector<error_t> results(4, UNINITIALIZED_ERROR);
+
+  mpc_runner->run_mpc([&](job_mp_t& job) {
+    const int party_index = job.get_party_idx();
+    if (party_index == malicious_index) {
+      results[party_index] = broadcast_foreign_curve_dkg_share(job, crypto::curve_secp256k1, crypto::curve_p521);
+      return;
+    }
+
+    buf_t sid;
+    results[party_index] = ecdsampc::dkg(job, crypto::curve_secp256k1, keys[party_index], sid);
+  });
+
+  EXPECT_OK(results[malicious_index]);
+  for (int i = 0; i < int(results.size()); i++) {
+    if (i == malicious_index) continue;
+    EXPECT_ER(results[i]);
+  }
+}
+
+TEST_F(ECDSA4PC, RejectsInvalidOtRoleMapDimensions) {
+  buf_t data = crypto::gen_random(32);
+  std::vector<ecdsampc::key_t> keys(4);
+
+  mpc_runner->run_mpc([&](job_mp_t& job) {
+    error_t rv = UNINITIALIZED_ERROR;
+    auto party_index = job.get_party_idx();
+    ecdsampc::key_t& key = keys[party_index];
+    ecurve_t curve = crypto::curve_secp256k1;
+    buf_t sid;
+    rv = ecdsampc::dkg(job, curve, key, sid);
+    ASSERT_EQ(rv, 0);
+
+    // Wrong outer dimension (should be 4).
+    std::vector<std::vector<int>> bad_map(1, std::vector<int>(1, ot_no_role));
+    buf_t sig;
+    rv = sign(job, key, data, party_idx_t(0), bad_map, sig);
+    EXPECT_EQ(rv, E_BADARG);
+  });
+}
+
+TEST_F(ECDSA4PC, RejectsInvalidOtRoleMapValues) {
+  buf_t data = crypto::gen_random(32);
+  std::vector<ecdsampc::key_t> keys(4);
+
+  mpc_runner->run_mpc([&](job_mp_t& job) {
+    error_t rv = UNINITIALIZED_ERROR;
+    auto party_index = job.get_party_idx();
+    ecdsampc::key_t& key = keys[party_index];
+    ecurve_t curve = crypto::curve_secp256k1;
+    buf_t sid;
+    rv = ecdsampc::dkg(job, curve, key, sid);
+    ASSERT_EQ(rv, 0);
+
+    auto bad_map = test_ot_role(4);
+    // Break invariants: invalid diagonal and invalid role value.
+    bad_map[0][0] = ot_sender;
+    bad_map[0][1] = 12345;
+
+    buf_t sig;
+    rv = sign(job, key, data, party_idx_t(0), bad_map, sig);
+    EXPECT_EQ(rv, E_BADARG);
+  });
+}
 
 TEST_P(ECDSAMPC, KeygenSignRefreshSign) {
   const int m = GetParam();
@@ -135,64 +274,59 @@ TEST_F(ECDSA4PC, KeygenSignRefreshSign) {
   check_keys(new_keys);
 }
 
-TEST_F(ECDSA4PC, ParallelKSRS8) {
-  int parallel_count = 8;
-  std::vector<buf_t> data(parallel_count);
-  for (int i = 0; i < parallel_count; i++) {
-    data[i] = crypto::gen_random(32);
+TEST(ECDSAMPCOutput, VerificationFailureClearsSignatureOutput) {
+  constexpr int n = 2;
+  const std::vector<crypto::pname_t> pnames(mpc_runner_t::test_pnames.begin(), mpc_runner_t::test_pnames.begin() + n);
+  std::vector<ecdsampc::key_t> keys(n);
+  std::vector<std::shared_ptr<mutate_ecdsa_verification_key_job_t>> mutating_jobs;
+  std::vector<std::shared_ptr<job_mp_t>> jobs;
+  mutating_jobs.reserve(n);
+  jobs.reserve(n);
+  for (int i = 0; i < n; i++) {
+    auto job = std::make_shared<mutate_ecdsa_verification_key_job_t>(party_idx_t(i), pnames, keys[i]);
+    mutating_jobs.push_back(job);
+    jobs.push_back(job);
   }
-  std::vector<std::vector<ecdsampc::key_t>> keys(parallel_count, std::vector<ecdsampc::key_t>(4));
-  std::vector<std::vector<ecdsampc::key_t>> new_keys(parallel_count, std::vector<ecdsampc::key_t>(4));
+  mpc_runner_t runner(jobs);
 
-  mpc_runner->run_mpc_parallel(parallel_count, [&keys, &new_keys, &data](job_session_mp_t& job, int th_i) {
-    std::vector<std::vector<int>> ot_role_map = test_ot_role(4);
-    error_t rv = UNINITIALIZED_ERROR;
-    auto party_index = job.get_party_idx();
-    ecdsampc::key_t& key = keys[th_i][party_index];
-    ecurve_t curve = crypto::curve_secp256k1;
-
+  std::vector<error_t> results(n, UNINITIALIZED_ERROR);
+  runner.run_mpc([&](job_mp_t& job) {
+    const int party_index = job.get_party_idx();
     buf_t sid;
-    rv = ecdsampc::dkg(job, curve, key, sid);
-    ASSERT_EQ(rv, 0);
+    results[party_index] = ecdsampc::dkg(job, crypto::curve_secp256k1, keys[party_index], sid);
+  });
+  ASSERT_EQ(results[0], SUCCESS);
+  ASSERT_EQ(results[1], SUCCESS);
 
-    buf_t sig;
-    rv = sign(job, key, data[th_i], party_idx_t(0), ot_role_map, sig);
-    ASSERT_EQ(rv, 0);
-
-    if (party_index == 0) {
-      crypto::ecc_pub_key_t ecc_verify_key(key.Q);
-      EXPECT_OK(ecc_verify_key.verify(data[th_i], sig));
-    }
-
-    ecdsampc::key_t& new_key = new_keys[th_i][party_index];
-    rv = ecdsampc::refresh(job, sid, key, new_key);
-    ASSERT_EQ(rv, 0);
-    EXPECT_EQ(new_key.Q, key.Q);
-    EXPECT_NE(new_key.x_share, key.x_share);
-
-    buf_t new_sig;
-    rv = sign(job, new_key, data[th_i], party_idx_t(0), ot_role_map, new_sig);
-    ASSERT_EQ(rv, 0);
-
-    if (party_index == 0) {
-      crypto::ecc_pub_key_t ecc_verify_key(key.Q);
-      EXPECT_OK(ecc_verify_key.verify(data[th_i], new_sig));
-    }
+  constexpr party_idx_t sig_receiver = 0;
+  mutating_jobs[sig_receiver]->arm();
+  const buf_t data = crypto::gen_random(32);
+  std::vector<buf_t> sigs(n, buf_t(1));
+  runner.run_mpc([&](job_mp_t& job) {
+    const int party_index = job.get_party_idx();
+    dylog_disable_scope_t no_log_err;
+    results[party_index] = sign(job, keys[party_index], data, sig_receiver, sigs[party_index]);
   });
 
-  for (int i = 0; i < parallel_count; i++) {
-    check_keys(keys[i]);
-    check_keys(new_keys[i]);
-  }
+  EXPECT_TRUE(mutating_jobs[sig_receiver]->mutated());
+  EXPECT_NE(results[sig_receiver], SUCCESS);
+  EXPECT_EQ(results[1], SUCCESS);
+  EXPECT_TRUE(sigs[0].empty());
+  EXPECT_TRUE(sigs[1].empty());
 }
 
-class ECDSAMPCTHRESHOLD : public NetworkMPC {};
-INSTANTIATE_TEST_SUITE_P(, ECDSAMPCTHRESHOLD, testing::Values(5));
+TEST(ECDSAMPCThreshold, DKG) {
+  int n = 5;
+  std::vector<crypto::pname_t> pnames = {"party-0", "party-1", "party-2", "party-3", "party-4"};
+  std::map<crypto::pname_t, int> quorum_party_map;
+  quorum_party_map[pnames[0]] = 0;
+  quorum_party_map[pnames[1]] = 1;
+  quorum_party_map[pnames[2]] = 2;
+  quorum_party_map[pnames[3]] = 3;
+  quorum_party_map[pnames[4]] = 4;
 
-TEST_P(ECDSAMPCTHRESHOLD, DKG) {
   // Hardwired for the test. If changed, many other things here should be changed
   // Also for simplicity of testing, we assume the first t parties are active
-  int n = 5;
   int t = 3;
 
   ecurve_t curve = crypto::curve_secp256k1;
@@ -200,21 +334,15 @@ TEST_P(ECDSAMPCTHRESHOLD, DKG) {
   mod_t q = curve.order();
   std::vector<eckey::key_share_mp_t> keyshares(n);
   std::vector<eckey::key_share_mp_t> new_keyshares(n);
-  std::vector<crypto::mpc_pid_t> all_pids(n);
-  std::vector<crypto::mpc_pid_t> active_pids(t);
-  crypto::ss::party_map_t<party_idx_t> name_to_idx;
+  std::set<crypto::pname_t> quorum1;
   party_set_t quorum_party_set;
 
-  quorum_party_set.add(0);
   quorum_party_set.add(1);
+  quorum1.insert(pnames[1]);
   quorum_party_set.add(2);
-  for (int i = 0; i < n; i++) {
-    all_pids[i] = mpc_runner_t::test_pids[i];
-  }
-  for (int i = 0; i < t; i++) {
-    active_pids[i] = all_pids[i];
-    name_to_idx[all_pids[i].to_string()] = i;
-  }
+  quorum1.insert(pnames[2]);
+  quorum_party_set.add(4);
+  quorum1.insert(pnames[4]);
 
   buf_t sid_dkg = crypto::gen_random(16);
   buf_t sid_refresh = crypto::gen_random(16);
@@ -223,36 +351,39 @@ TEST_P(ECDSAMPCTHRESHOLD, DKG) {
       crypto::ss::node_e::AND, "", 0,
       {new crypto::ss::node_t(crypto::ss::node_e::THRESHOLD, "threshold-node", 2,
                               {
-                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, all_pids[0].to_string()),  // active
-                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, all_pids[1].to_string()),  // active
-                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, all_pids[3].to_string()),
+                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, pnames[0]),  // active
+                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, pnames[1]),  // active
+                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, pnames[2]),
                               }),
        new crypto::ss::node_t(crypto::ss::node_e::OR, "or-node", 0,
                               {
-                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, all_pids[2].to_string()),  // active
-                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, all_pids[4].to_string()),
+                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, pnames[3]),  // active
+                                  new crypto::ss::node_t(crypto::ss::node_e::LEAF, pnames[4]),
                               })});
   crypto::ss::ac_t ac;
-  ac.G = G;
+  ac.curve = curve;
   ac.root = root_node;
 
   // DKG is an n-party protocol
-  mpc_runner = std::make_unique<mpc_runner_t>(n);
-  mpc_runner->run_mpc([&curve, &keyshares, &quorum_party_set, &ac, &sid_dkg](mpc::job_mp_t& job) {
-    eckey::dkg_mp_threshold_t dkg_threshold;
-    EXPECT_OK(dkg_threshold.dkg(job, curve, sid_dkg, ac, quorum_party_set, keyshares[job.get_party_idx()]));
+  mpc_runner_t all_parties_runner(pnames);
+  all_parties_runner.run_mpc([&curve, &keyshares, &quorum_party_set, &ac, &sid_dkg](mpc::job_mp_t& job) {
+    EXPECT_OK(eckey::key_share_mp_t::dkg_ac(job, curve, sid_dkg, ac, quorum_party_set, keyshares[job.get_party_idx()]));
   });
+
+  for (int i = 0; i < n; i++) {
+    ASSERT_EQ(keyshares[i].x_share * G, keyshares[0].Qis[pnames[i]]);
+  }
 
   ASSERT_EQ(sid_dkg.size(), 16);
 
   // Signing is a t-party protocol
-  mpc_runner = std::make_unique<mpc_runner_t>(t);
+  mpc_runner_t quorum_runner({"party-1", "party-2", "party-4"});
+
   buf_t data = crypto::gen_random(32);
   std::vector<std::vector<int>> ot_role_map = test_ot_role(t);
-  mpc_runner->run_mpc([&curve, &keyshares, &ac, &name_to_idx, &q, &t, &n, &data, &ot_role_map](mpc::job_mp_t& job) {
+  quorum_runner.run_mpc([&](mpc::job_mp_t& job) {
     eckey::key_share_mp_t additive_share;
-    EXPECT_OK(
-        keyshares[job.get_party_idx()].to_additive_share(job.get_party_idx(), ac, t, name_to_idx, additive_share));
+    EXPECT_OK(keyshares[quorum_party_map[job.get_name()]].to_additive_share(ac, quorum1, additive_share));
     buf_t sig;
     error_t rv = sign(job, additive_share, data, party_idx_t(0), ot_role_map, sig);
     ASSERT_EQ(rv, 0);
@@ -264,25 +395,28 @@ TEST_P(ECDSAMPCTHRESHOLD, DKG) {
   });
 
   // Refresh is an n-party protocol
-  mpc_runner = std::make_unique<mpc_runner_t>(n);
-  mpc_runner->run_mpc([&curve, &keyshares, &new_keyshares, &quorum_party_set, &ac, &sid_refresh](mpc::job_mp_t& job) {
-    eckey::dkg_mp_threshold_t dkg_threshold;
-    ASSERT_OK(dkg_threshold.refresh(job, curve, sid_refresh, ac, quorum_party_set, keyshares[job.get_party_idx()],
-                                    new_keyshares[job.get_party_idx()]));
+  all_parties_runner.run_mpc([&](mpc::job_mp_t& job) {
+    ASSERT_OK(eckey::key_share_mp_t::refresh_ac(job, curve, sid_refresh, ac, quorum_party_set,
+                                                keyshares[job.get_party_idx()], new_keyshares[job.get_party_idx()]));
   });
   ASSERT_EQ(sid_refresh.size(), 16);
   ASSERT_NE(sid_refresh, sid_dkg);
 
-  EXPECT_EQ(new_keyshares[0].Q, keyshares[0].Q);
-  EXPECT_NE(new_keyshares[0].x_share, keyshares[0].x_share);
+  for (int i = 0; i < n; i++) {
+    EXPECT_EQ(new_keyshares[i].Q, keyshares[i].Q);
+    EXPECT_NE(new_keyshares[i].x_share, keyshares[i].x_share);
+  }
 
-  // Signing is a t-party protocol: for simplicity of testing, we assume the first t parties
-  mpc_runner = std::make_unique<mpc_runner_t>(t);
+  mpc_runner_t quorum2_runner({"party-0", "party-1", "party-3"});
+  std::set<crypto::pname_t> quorum2;
+  quorum2.insert(pnames[0]);
+  quorum2.insert(pnames[1]);
+  quorum2.insert(pnames[3]);
+
   data = crypto::gen_random(32);
-  mpc_runner->run_mpc([&curve, &new_keyshares, &ac, &name_to_idx, &q, &t, &n, &data, &ot_role_map](mpc::job_mp_t& job) {
+  quorum2_runner.run_mpc([&](mpc::job_mp_t& job) {
     eckey::key_share_mp_t additive_share;
-    EXPECT_OK(
-        new_keyshares[job.get_party_idx()].to_additive_share(job.get_party_idx(), ac, t, name_to_idx, additive_share));
+    EXPECT_OK(new_keyshares[quorum_party_map[job.get_name()]].to_additive_share(ac, quorum2, additive_share));
     buf_t sig;
     error_t rv = sign(job, additive_share, data, party_idx_t(0), ot_role_map, sig);
     ASSERT_EQ(rv, 0);
@@ -293,27 +427,23 @@ TEST_P(ECDSAMPCTHRESHOLD, DKG) {
     }
   });
 
-  ASSERT_EQ(keyshares[0].x_share * G, keyshares[0].Qis[0]);
-  ASSERT_EQ(keyshares[1].x_share * G, keyshares[1].Qis[1]);
-  ASSERT_EQ(keyshares[2].x_share * G, keyshares[2].Qis[2]);
+  for (int i = 0; i < n; i++) {
+    ASSERT_EQ(keyshares[i].x_share * G, keyshares[i].Qis[pnames[i]]);
+    ASSERT_EQ(new_keyshares[i].x_share * G, new_keyshares[i].Qis[pnames[i]]);
+  }
 
   for (int i = 1; i < n; i++) {
-    EXPECT_EQ(keyshares[i].Qis[0], keyshares[0].Qis[0]);
-    EXPECT_EQ(keyshares[i].Qis[1], keyshares[0].Qis[1]);
-    EXPECT_EQ(keyshares[i].Qis[2], keyshares[0].Qis[2]);
+    for (int j = 0; j < n; j++) {
+      EXPECT_EQ(keyshares[i].Qis[pnames[j]], keyshares[0].Qis[pnames[j]]);
+    }
   }
 
   std::vector<eckey::key_share_mp_t> new_additive_shares(n);
   for (int i = 0; i < n; i++) {
-    EXPECT_OK(new_keyshares[i].to_additive_share(i, ac, t, name_to_idx, new_additive_shares[i]));
+    EXPECT_OK(new_keyshares[i].to_additive_share(ac, quorum2, new_additive_shares[i]));
   }
   EXPECT_EQ(
-      ((new_additive_shares[0].x_share + new_additive_shares[1].x_share + new_additive_shares[2].x_share) % q) * G,
-      new_keyshares[0].Q);
-
-  crypto::vartime_scope_t vartime_scope;
-  ASSERT_EQ(
-      ((new_additive_shares[0].x_share + new_additive_shares[1].x_share + new_additive_shares[2].x_share) % q) * G,
+      ((new_additive_shares[0].x_share + new_additive_shares[1].x_share + new_additive_shares[3].x_share) % q) * G,
       new_keyshares[0].Q);
 }
 

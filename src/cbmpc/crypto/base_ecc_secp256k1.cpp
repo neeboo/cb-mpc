@@ -1,4 +1,5 @@
-#include "base_ecc_secp256k1.h"
+#include <cbmpc/internal/crypto/base_bn256.h>
+#include <cbmpc/internal/crypto/base_ecc_secp256k1.h>
 
 // clang-format off
 #include "secp256k1/src/assumptions.h"
@@ -33,6 +34,43 @@ namespace secp256k1 {
 point_ptr_t new_point(const point_ptr_t src) { return point_ptr_t(new secp256k1_gej(*(const secp256k1_gej*)src)); }
 }  // namespace secp256k1
 
+static secp256k1_ge secp256k1_gej_to_ge(const secp256k1_gej* gej) {
+  secp256k1_gej tmp = *gej;
+  secp256k1_ge ge;
+  secp256k1_ge_set_gej(&ge, &tmp);
+  return ge;
+}
+
+// Constant-time addition for secp256k1_gej points for all inputs (including infinity).
+// Implementation strategy:
+// - Use libsecp256k1's `secp256k1_gej_add_ge` (side-channel resistant, handles degeneracy),
+//   which requires the second operand in affine form and non-infinity.
+// - If the second operand is infinity, cmov it to generator (any fixed non-infinity point),
+//   perform the addition, then cmov the result back to `a`.
+static void secp256k1_gej_add_consttime_full(secp256k1_gej* r, const secp256k1_gej* a, const secp256k1_gej* b) {
+  SECP256K1_GEJ_VERIFY(a);
+  SECP256K1_GEJ_VERIFY(b);
+
+  const int b_is_inf = b->infinity;
+
+  secp256k1_gej b_noninf = *b;
+  secp256k1_gej_cmov(&b_noninf, &G, b_is_inf);  // ensure non-infinity for affine conversion
+
+  // Convert a copy of b_noninf to affine (constant-time inversion via secp256k1_fe_inv).
+  secp256k1_ge b_ge;
+  secp256k1_gej b_tmp = b_noninf;
+  secp256k1_ge_set_gej(&b_ge, &b_tmp);
+  VERIFY_CHECK(!b_ge.infinity);
+
+  // Add in (side-channel resistant) constant-time.
+  secp256k1_gej_add_ge(r, a, &b_ge);
+
+  // If original `b` was infinity, the result should be `a`.
+  secp256k1_gej_cmov(r, a, b_is_inf);
+
+  SECP256K1_GEJ_VERIFY(r);
+}
+
 ecurve_secp256k1_t::ecurve_secp256k1_t() noexcept {
   name = "SECP256K1";
   type = ecurve_type_e::bitcoin;
@@ -48,6 +86,10 @@ ecurve_secp256k1_t::ecurve_secp256k1_t() noexcept {
 
   secp256k1_gej_set_ge(&G, &secp256k1_ge_const_g);
   secp256k1_ecmult_gen_context_build(&secp256k1_ecmult_gen_ctx);
+  byte_t blind_seed[32];
+  gen_random(blind_seed, sizeof(blind_seed));
+  secp256k1_ecmult_gen_blind(&secp256k1_ecmult_gen_ctx, blind_seed);
+  secure_bzero(blind_seed);
 }
 
 const mod_t& ecurve_secp256k1_t::order() const { return q; }
@@ -81,9 +123,13 @@ void ecurve_secp256k1_t::copy_point(ecc_point_t& Dst, const ecc_point_t& Src) co
   Dst.secp256k1 = secp256k1::new_point(Src.secp256k1);
 }
 
+bool ecurve_secp256k1_t::cnd_copy_point(bool flag, const ecc_point_t& Src, ecc_point_t& Dst) const {
+  secp256k1_gej_cmov((secp256k1_gej*)Dst.secp256k1, (const secp256k1_gej*)Src.secp256k1, static_cast<int>(flag));
+  return true;
+}
+
 bool ecurve_secp256k1_t::is_on_curve(const ecc_point_t& P) const {
-  secp256k1_ge ge;
-  secp256k1_ge_set_gej(&ge, (secp256k1_gej*)P.secp256k1);
+  secp256k1_ge ge = secp256k1_gej_to_ge((const secp256k1_gej*)P.secp256k1);
   return 0 != secp256k1_ge_is_valid_var(&ge);
 }
 
@@ -99,9 +145,8 @@ bool ecurve_secp256k1_t::equ_points(const ecc_point_t& P1, const ecc_point_t& P2
   if (is_infinity(P1)) return is_infinity(P2);
   if (is_infinity(P2)) return is_infinity(P1);
 
-  secp256k1_ge ge1, ge2;
-  secp256k1_ge_set_gej(&ge1, (secp256k1_gej*)P1.secp256k1);
-  secp256k1_ge_set_gej(&ge2, (secp256k1_gej*)P2.secp256k1);
+  secp256k1_ge ge1 = secp256k1_gej_to_ge((const secp256k1_gej*)P1.secp256k1);
+  secp256k1_ge ge2 = secp256k1_gej_to_ge((const secp256k1_gej*)P2.secp256k1);
   return secp256k1_fe_equal(&ge1.x, &ge2.x) && secp256k1_fe_equal(&ge1.y, &ge2.y);
 }
 
@@ -110,61 +155,16 @@ void ecurve_secp256k1_t::invert_point(ecc_point_t& P) const {
 }
 
 void ecurve_secp256k1_t::add(const ecc_point_t& P1, const ecc_point_t& P2, ecc_point_t& R) const {
-  secp256k1_gej_add_var((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P1.secp256k1,
-                        (const secp256k1_gej*)P2.secp256k1, nullptr);
-}
-
-// This function does not work for some special cases, like when a or b is infinity, or a and b have the same z
-// coordinate. When points are random, the probability of these cases is negligible.
-static void secp256k1_gej_add_const(secp256k1_gej* r, const secp256k1_gej* a, const secp256k1_gej* b) {
-  cb_assert(!a->infinity);
-  cb_assert(!b->infinity);
-
-  secp256k1_fe z22, z12, u1, u2, s1, s2, h, i, h2, h3, t;
-  SECP256K1_GEJ_VERIFY(a);
-  SECP256K1_GEJ_VERIFY(b);
-
-  secp256k1_fe_sqr(&z22, &b->z);
-  secp256k1_fe_sqr(&z12, &a->z);
-  secp256k1_fe_mul(&u1, &a->x, &z22);
-  secp256k1_fe_mul(&u2, &b->x, &z12);
-  secp256k1_fe_mul(&s1, &a->y, &z22);
-  secp256k1_fe_mul(&s1, &s1, &b->z);
-  secp256k1_fe_mul(&s2, &b->y, &z12);
-  secp256k1_fe_mul(&s2, &s2, &a->z);
-  secp256k1_fe_negate(&h, &u1, 1);
-  secp256k1_fe_add(&h, &u2);
-  secp256k1_fe_negate(&i, &s2, 1);
-  secp256k1_fe_add(&i, &s1);
-
-  cb_assert(!secp256k1_fe_normalizes_to_zero(&h));
-  cb_assert(!secp256k1_fe_normalizes_to_zero(&i));
-
-  r->infinity = 0;
-  secp256k1_fe_mul(&t, &h, &b->z);
-  secp256k1_fe_mul(&r->z, &a->z, &t);
-
-  secp256k1_fe_sqr(&h2, &h);
-  secp256k1_fe_negate(&h2, &h2, 1);
-  secp256k1_fe_mul(&h3, &h2, &h);
-  secp256k1_fe_mul(&t, &u1, &h2);
-
-  secp256k1_fe_sqr(&r->x, &i);
-  secp256k1_fe_add(&r->x, &h3);
-  secp256k1_fe_add(&r->x, &t);
-  secp256k1_fe_add(&r->x, &t);
-
-  secp256k1_fe_add(&t, &r->x);
-  secp256k1_fe_mul(&r->y, &t, &i);
-  secp256k1_fe_mul(&h3, &h3, &s1);
-  secp256k1_fe_add(&r->y, &h3);
-
-  SECP256K1_GEJ_VERIFY(r);
+  if (P1.secp256k1 == P2.secp256k1)
+    secp256k1_gej_double_var((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P1.secp256k1, nullptr);
+  else
+    secp256k1_gej_add_var((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P1.secp256k1,
+                          (const secp256k1_gej*)P2.secp256k1, nullptr);
 }
 
 void ecurve_secp256k1_t::add_consttime(const ecc_point_t& P1, const ecc_point_t& P2, ecc_point_t& R) const {
-  secp256k1_gej_add_const((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P1.secp256k1,
-                          (const secp256k1_gej*)P2.secp256k1);
+  secp256k1_gej_add_consttime_full((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P1.secp256k1,
+                                   (const secp256k1_gej*)P2.secp256k1);
 }
 
 void ecurve_secp256k1_t::mul_vartime(const ecc_point_t& P, const bn_t& x, ecc_point_t& R) const {
@@ -176,9 +176,6 @@ void ecurve_secp256k1_t::mul_vartime(const ecc_point_t& P, const bn_t& x, ecc_po
 
   secp256k1_ecmult((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P.secp256k1, &scalar_x, nullptr);
 
-  secp256k1_ge a;
-  secp256k1_ge_set_gej_var(&a, (secp256k1_gej*)P.secp256k1);
-
   bzero(scalar_x);
 }
 
@@ -189,8 +186,7 @@ void ecurve_secp256k1_t::mul(const ecc_point_t& P, const bn_t& x, ecc_point_t& R
   secp256k1_scalar scalar_x;
   secp256k1_scalar_set_b32(&scalar_x, bin.data(), nullptr);
 
-  secp256k1_ge a;
-  secp256k1_ge_set_gej(&a, (secp256k1_gej*)P.secp256k1);
+  secp256k1_ge a = secp256k1_gej_to_ge((const secp256k1_gej*)P.secp256k1);
 
   secp256k1_ecmult_const((secp256k1_gej*)R.secp256k1, &a, &scalar_x);
   bzero(scalar_x);
@@ -209,22 +205,39 @@ void ecurve_secp256k1_t::mul_add(const bn_t& n, const ecc_point_t& P, const bn_t
   secp256k1_scalar_set_b32(&scalar_n, bin_n.data(), nullptr);
   secp256k1_scalar_set_b32(&scalar_m, bin_m.data(), nullptr);
 
+  if (is_vartime_scope()) {
+    // Verifier code paths allow variable-time operations and require robustness for all inputs.
+    secp256k1_ecmult((secp256k1_gej*)R.secp256k1, (const secp256k1_gej*)P.secp256k1, &scalar_m, &scalar_n);
+    secp256k1_scalar_clear(&scalar_m);
+    secp256k1_scalar_clear(&scalar_n);
+    return;
+  }
+
   secp256k1_gej Rn;
   secp256k1_ecmult_gen(&secp256k1_ecmult_gen_ctx, &Rn, &scalar_n);
 
-  // Convert P to affine coordinates for secp256k1_ecmult_const
-  // This involves a field inversion, which is variable-time. Since P is public,
-  // this is usually acceptable. If P is secret, you'll need a constant-time inversion method.
+  // Convert P to affine coordinates for secp256k1_ecmult_const.
+  // Use the constant-time conversion (secp256k1_fe_inv via secp256k1_ge_set_gej).
+  // Also ensure we never feed infinity into secp256k1_ge_set_gej by cmov'ing to generator.
+  secp256k1_gej Pj = *(const secp256k1_gej*)P.secp256k1;
+  const int P_is_inf = Pj.infinity;
+  secp256k1_gej_cmov(&Pj, &G, P_is_inf);
+
   secp256k1_ge P_ge;
-  secp256k1_ge_set_gej(&P_ge, (secp256k1_gej*)P.secp256k1);
+  secp256k1_ge_set_gej(&P_ge, &Pj);
+  VERIFY_CHECK(!P_ge.infinity);
 
   // Compute Rm = mP in constant-time
   secp256k1_gej Rm;
   secp256k1_ecmult_const(&Rm, &P_ge, &scalar_m);
 
-  secp256k1_gej R_sum;
-  secp256k1_gej_add_const(&R_sum, &Rm, &Rn);
+  // If original P was infinity, mP is infinity.
+  secp256k1_gej inf;
+  secp256k1_gej_set_infinity(&inf);
+  secp256k1_gej_cmov(&Rm, &inf, P_is_inf);
 
+  secp256k1_gej R_sum;
+  secp256k1_gej_add_consttime_full(&R_sum, &Rm, &Rn);
   memcpy(R.secp256k1, &R_sum, sizeof(R_sum));
 
   secp256k1_scalar_clear(&scalar_m);
@@ -246,9 +259,9 @@ void ecurve_secp256k1_t::mul_to_generator(const bn_t& x, ecc_point_t& P) const {
 
 int ecurve_secp256k1_t::to_compressed_bin(const ecc_point_t& P, byte_ptr out) const {
   if (out) {
+    memset(out, 0, 33);
     size_t size = 0;
-    secp256k1_ge ge;
-    secp256k1_ge_set_gej(&ge, (secp256k1_gej*)P.secp256k1);
+    secp256k1_ge ge = secp256k1_gej_to_ge((const secp256k1_gej*)P.secp256k1);
     secp256k1_eckey_pubkey_serialize(&ge, out, &size, 1);
   }
   return 33;
@@ -256,9 +269,9 @@ int ecurve_secp256k1_t::to_compressed_bin(const ecc_point_t& P, byte_ptr out) co
 
 int ecurve_secp256k1_t::to_bin(const ecc_point_t& P, byte_ptr out) const {
   if (out) {
+    memset(out, 0, 65);
     size_t size = 0;
-    secp256k1_ge ge;
-    secp256k1_ge_set_gej(&ge, (secp256k1_gej*)P.secp256k1);
+    secp256k1_ge ge = secp256k1_gej_to_ge((const secp256k1_gej*)P.secp256k1);
     secp256k1_eckey_pubkey_serialize(&ge, out, &size, 0);
   }
   return 65;
@@ -284,12 +297,34 @@ void ecurve_secp256k1_t::get_coordinates(const ecc_point_t& P, bn_t& x, bn_t& y)
   y = bn_t::from_bin(buf.range(33, 32));
 }
 
-void ecurve_secp256k1_t::set_coordinates(ecc_point_t& P, const bn_t& x, const bn_t& y) const {
-  buf_t buf(65);
-  buf[0] = 4;
-  x.to_bin(buf.data() + 1, 32);
-  y.to_bin(buf.data() + 33, 32);
-  from_bin(P, buf);
+void ecurve_secp256k1_t::get_coordinates(const std::vector<ecc_point_t>& P, std::vector<bn256_t>& x,
+                                         std::vector<bn256_t>& y) {
+  int n = int(P.size());
+  if (n == 0) {
+    x.clear();
+    y.clear();
+    return;
+  }
+
+  std::vector<secp256k1_gej> gej(n);
+  std::vector<secp256k1_ge> ge(n);
+  for (int i = 0; i < n; i++) {
+    cb_assert(P[i].valid());
+    cb_assert(P[i].get_curve() == curve_secp256k1);
+    gej[i] = *(const secp256k1_gej*)P[i].secp256k1;
+  }
+  secp256k1_ge_set_all_gej_var(ge.data(), gej.data(), n);
+  x.resize(n);
+  y.resize(n);
+  for (int i = 0; i < n; i++) {
+    uint8_t bin[32];
+    secp256k1_fe_normalize_var(&ge[i].x);
+    secp256k1_fe_get_b32(bin, &ge[i].x);
+    x[i] = bn256_t::from_bin(mem_t(bin, 32));
+    secp256k1_fe_normalize_var(&ge[i].y);
+    secp256k1_fe_get_b32(bin, &ge[i].y);
+    y[i] = bn256_t::from_bin(mem_t(bin, 32));
+  }
 }
 
 bool ecurve_secp256k1_t::hash_to_point(mem_t bin, ecc_point_t& Q) const {
@@ -302,11 +337,10 @@ bool ecurve_secp256k1_t::hash_to_point(mem_t bin, ecc_point_t& Q) const {
 }
 
 static EC_POINT* to_ossl_point(const EC_GROUP* group, secp256k1::point_ptr_t ptr) {
-  byte_t bin[65];
+  byte_t bin[65] = {0};
 
   size_t size = 0;
-  secp256k1_ge ge;
-  secp256k1_ge_set_gej(&ge, (secp256k1_gej*)ptr);
+  secp256k1_ge ge = secp256k1_gej_to_ge((const secp256k1_gej*)ptr);
   secp256k1_eckey_pubkey_serialize(&ge, bin, &size, 0);
 
   EC_POINT* point = EC_POINT_new(group);
@@ -324,12 +358,12 @@ buf_t ecurve_secp256k1_t::sign(const ecc_prv_key_t& K, mem_t hash) const {
 }
 
 buf_t ecurve_secp256k1_t::pub_to_der(const ecc_pub_key_t& P) const {
-  cb_assert("not implemented");
+  cb_assert(false && "ecurve_secp256k1_t::pub_to_der is not supported");
   return buf_t();
 }
 
 buf_t ecurve_secp256k1_t::prv_to_der(const ecc_prv_key_t& K) const {
-  cb_assert("not implemented");
+  cb_assert(false && "ecurve_secp256k1_t::prv_to_der is not supported");
   return buf_t();
 }
 
@@ -340,13 +374,11 @@ void ecurve_secp256k1_t::set_ossl_point(ecc_point_t& P, const EC_POINT* point) c
 }
 
 error_t ecurve_secp256k1_t::pub_from_der(ecc_pub_key_t& P, mem_t der) const {
-  cb_assert("not implemented");
-  return coinbase::error(E_NOT_SUPPORTED);
+  return coinbase::error(E_NOT_SUPPORTED, "ecurve_secp256k1_t::pub_from_der is not supported");
 }
 
 error_t ecurve_secp256k1_t::prv_from_der(ecc_prv_key_t& K, mem_t der) const {
-  cb_assert("not implemented");
-  return coinbase::error(E_NOT_SUPPORTED);
+  return coinbase::error(E_NOT_SUPPORTED, "ecurve_secp256k1_t::prv_from_der is not supported");
 }
 
 namespace bip340 {
@@ -365,6 +397,8 @@ bn_t hash_message(const bn_t& rx, const ecc_point_t& pub_key, mem_t message) {
 error_t verify(const ecc_point_t& pub_key, mem_t m, mem_t sig) {
   error_t rv = UNINITIALIZED_ERROR;
   if (sig.size != 64) return coinbase::error(E_BADARG, "BIP340 verify: sig size != 64");
+  if (m.size != 32) return coinbase::error(E_BADARG, "BIP340 verify: msg size != 32");
+  if (!m.data) return coinbase::error(E_BADARG, "BIP340 verify: msg is null");
 
   ecurve_t curve = curve_secp256k1;
   const mod_t& q = curve.order();

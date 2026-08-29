@@ -1,8 +1,21 @@
 # We generate the .a files here
 lib/
 
+# Object & binary blobs
+a.out
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+*.sancov
+
 # CMake generated files
 **build/
+cmake_test_discovery_*.json
 
 # ctest files
 **Testing/
@@ -11,10 +24,5 @@ lib/
 docsgen/
 node_modules/
 
-# rust
-target/
-.DS_Store
-.idea/
-.vscode/
-.devcontainer/
-
+# Internal tool outputs for human review
+internal_tools/doc-generator/pdf-diffs/

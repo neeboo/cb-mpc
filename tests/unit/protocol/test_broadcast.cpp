@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include <cbmpc/protocol/committed_broadcast.h>
-#include <cbmpc/protocol/util.h>
+#include <cbmpc/internal/protocol/committed_broadcast.h>
+#include <cbmpc/internal/protocol/util.h>
 
 #include "utils/local_network/mpc_tester.h"
 #include "utils/test_macros.h"
@@ -30,11 +30,8 @@ TEST_F(CommittedGroupBroadcast, Completeness) {
       EXPECT_EQ(msg_r.received(i), m[i]);
       EXPECT_EQ(msg_str.received(i), std::string("test"));
 
-      EXPECT_EQ(msg_r.all_received_refs()[i].get(), m[i]);
-      EXPECT_EQ(msg_str.all_received_refs()[i].get(), std::string("test"));
-
-      EXPECT_EQ(msg_r.all_received_values()[i], m[i]);
-      EXPECT_EQ(msg_str.all_received_values()[i], std::string("test"));
+      EXPECT_EQ(msg_r.all_received()[i], m[i]);
+      EXPECT_EQ(msg_str.all_received()[i], std::string("test"));
     }
     EXPECT_EQ(msg_r.msg, m[party_index]);
     EXPECT_EQ(msg_str.msg, std::string("test"));

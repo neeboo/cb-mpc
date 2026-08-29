@@ -1,12 +1,18 @@
 
-#include "base_ec_core.h"
+#include <cbmpc/internal/crypto/base_ec_core.h>
 
 namespace coinbase::crypto {
 
 booth_wnaf_t::booth_wnaf_t(int _win, const bn_t& x, int _bits, bool _back)
     : win(_win), bits(_bits), back(_back), index(0) {
-  x.to_bin(data, 33);
-  mem_t(data, 33).reverse();
+  cb_assert(sizeof(BN_ULONG) * 8 == 64);
+
+  bzero(data, 33);
+  const BIGNUM& bn = *(const BIGNUM*)x;
+  cb_assert(bn.neg == 0);
+  cb_assert(bn.top <= 4);
+
+  if (bn.top > 0) memmove(data, bn.d, bn.top * sizeof(BN_ULONG));
 
   if (back) index = (((bits - 1) + (win - 1)) / win) * win;
 }
@@ -57,23 +63,6 @@ bool booth_wnaf_t::get(unsigned& value, bool& neg) {
 }
 
 #ifdef __x86_64__
-void ct_get2(__m128i* dst, const __m128i* precomp, int line_size, unsigned index) {
-  __m128i lo1, hi1, lo2, hi2;
-  lo1 = hi1 = lo2 = hi2 = _mm_setzero_si128();
-  for (unsigned i = 0; i < line_size; i++) {
-    __m128i mask = _mm_set1_epi32(-(index == i));
-    lo1 = _mm_or_si128(lo1, _mm_and_si128(mask, _mm_load_si128(precomp + 0)));
-    hi1 = _mm_or_si128(hi1, _mm_and_si128(mask, _mm_load_si128(precomp + 1)));
-    lo2 = _mm_or_si128(lo2, _mm_and_si128(mask, _mm_load_si128(precomp + 2)));
-    hi2 = _mm_or_si128(hi2, _mm_and_si128(mask, _mm_load_si128(precomp + 3)));
-    precomp += 2 * 2;
-  }
-  _mm_storeu_si128(dst + 0, lo1);
-  _mm_storeu_si128(dst + 1, hi1);
-  _mm_storeu_si128(dst + 2, lo2);
-  _mm_storeu_si128(dst + 3, hi2);
-}
-
 void ct_get3(__m128i* dst, const __m128i* precomp, int line_size, unsigned index) {
   __m128i lo1, hi1, lo2, hi2, lo3, hi3;
   lo1 = hi1 = lo2 = hi2 = lo3 = hi3 = _mm_setzero_si128();
