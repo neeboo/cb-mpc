@@ -1,0 +1,15 @@
+[package]
+name = "cb-mpc-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI and ownership boundary for Coinbase cb-mpc"
+links = "cbmpc"
+build = "build.rs"
+
+[lib]
+name = "cb_mpc_sys"
+
+[build-dependencies]
+bindgen = "0.71"

@@ -1,14 +1,9 @@
 [workspace]
-members = [
-    "cblib",
-    "network"
-]
-
+members = ["cb-mpc-sys"]
 resolver = "2"
 
-[workspace.dependencies]
-libc = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-bindgen = "0.71"
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/neeboo/cb-mpc"
