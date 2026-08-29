@@ -1,5 +1,5 @@
 [workspace]
-members = ["cb-mpc-sys"]
+members = ["cb-mpc-sys", "cb-mpc"]
 resolver = "2"
 
 [workspace.package]

@@ -49,3 +49,16 @@ crate accepts `CBMPC_OPENSSL_ROOT`; the referenced directory must contain
 The implementation remains the upstream C++ cryptographic core. The Rust crates
 are bindings and safe ownership/lifetime adapters; they are not a pure-Rust MPC
 implementation.
+
+## Legacy Rust wrapper migration
+
+The old `cb-mpc-rs/cblib` and `cb-mpc-rs/network` crates are deliberately
+deleted on the refresh branch. Their API targeted internal C++ classes and a
+committed, platform-specific bindgen snapshot. It also contained invalid
+out-pointer calls, null dereferences during `Drop`, callback allocator transfer
+through `Vec::from_raw_parts`, and flattened C views whose Rust backing vectors
+were dropped before the FFI call.
+
+The replacement workspace is split into `cb-mpc-sys` and `cb-mpc`. Only the sys
+crate contains generated C declarations or `unsafe`; the safe crate exchanges
+owned byte vectors and typed errors.

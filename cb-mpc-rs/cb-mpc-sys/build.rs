@@ -1,5 +1,5 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn run(command: &mut Command, description: &str) {
@@ -117,6 +117,3 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=CBMPC_OPENSSL_ROOT");
 }
-
-#[allow(dead_code)]
-fn _assert_path(_: &Path) {}

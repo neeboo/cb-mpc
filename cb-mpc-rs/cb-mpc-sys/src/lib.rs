@@ -305,6 +305,249 @@ impl<'a> MpJob<'a> {
     }
 }
 
+struct CNames {
+    _names: Vec<CString>,
+    pointers: Vec<*const c_char>,
+}
+
+impl CNames {
+    fn new(names: &[String]) -> Result<Self, Error> {
+        let names = names
+            .iter()
+            .map(|name| CString::new(name.as_str()).map_err(|_| Error::InvalidArgument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pointers = names.iter().map(|name| name.as_ptr()).collect();
+        Ok(Self {
+            _names: names,
+            pointers,
+        })
+    }
+
+    fn as_ptr(&self) -> *const *const c_char {
+        if self.pointers.is_empty() {
+            ptr::null()
+        } else {
+            self.pointers.as_ptr()
+        }
+    }
+
+    fn count(&self) -> Result<i32, Error> {
+        i32::try_from(self.pointers.len()).map_err(|_| Error::InputTooLarge)
+    }
+}
+
+struct ThresholdAccessStructure {
+    raw: bindings::cbmpc_access_structure_t,
+    _leaf_names: Vec<CString>,
+    nodes: Vec<bindings::cbmpc_access_structure_node_t>,
+    child_indices: Vec<i32>,
+}
+
+impl ThresholdAccessStructure {
+    fn new(threshold: usize, party_names: &[String]) -> Result<Self, Error> {
+        if threshold == 0 || threshold > party_names.len() || party_names.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        let threshold = i32::try_from(threshold).map_err(|_| Error::InputTooLarge)?;
+        let party_count = i32::try_from(party_names.len()).map_err(|_| Error::InputTooLarge)?;
+        let leaf_names = party_names
+            .iter()
+            .map(|name| CString::new(name.as_str()).map_err(|_| Error::InvalidArgument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut nodes = Vec::with_capacity(leaf_names.len() + 1);
+        nodes.push(bindings::cbmpc_access_structure_node_t {
+            type_:
+                bindings::cbmpc_access_structure_node_type_e_CBMPC_ACCESS_STRUCTURE_NODE_THRESHOLD,
+            leaf_name: ptr::null(),
+            threshold_k: threshold,
+            child_indices_offset: 0,
+            child_indices_count: party_count,
+        });
+        nodes.extend(
+            leaf_names
+                .iter()
+                .map(|name| bindings::cbmpc_access_structure_node_t {
+                    type_: bindings::cbmpc_access_structure_node_type_e_CBMPC_ACCESS_STRUCTURE_NODE_LEAF,
+                    leaf_name: name.as_ptr(),
+                    threshold_k: 0,
+                    child_indices_offset: 0,
+                    child_indices_count: 0,
+                }),
+        );
+        let child_indices = (1..=party_count).collect::<Vec<_>>();
+        let raw = bindings::cbmpc_access_structure_t {
+            nodes: nodes.as_ptr(),
+            nodes_count: i32::try_from(nodes.len()).map_err(|_| Error::InputTooLarge)?,
+            child_indices: child_indices.as_ptr(),
+            child_indices_count: party_count,
+            root_index: 0,
+        };
+        Ok(Self {
+            raw,
+            _leaf_names: leaf_names,
+            nodes,
+            child_indices,
+        })
+    }
+
+    fn as_raw(&self) -> &bindings::cbmpc_access_structure_t {
+        debug_assert_eq!(self.raw.nodes, self.nodes.as_ptr());
+        debug_assert_eq!(self.raw.child_indices, self.child_indices.as_ptr());
+        &self.raw
+    }
+}
+
+/// Run one party's threshold ECDSA DKG call.
+pub fn ecdsa_mp_dkg_threshold(
+    self_index: usize,
+    party_names: &[String],
+    threshold: usize,
+    quorum_party_names: &[String],
+    transport: &dyn Transport,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let job = MpJob::new(self_index, party_names, transport)?;
+    let access_structure = ThresholdAccessStructure::new(threshold, party_names)?;
+    let quorum = CNames::new(quorum_party_names)?;
+    let empty_sid = BorrowedCmem::new(&[])?;
+    let mut out_key = OutCmem::new();
+    let mut out_sid = OutCmem::new();
+    let code = unsafe {
+        bindings::cbmpc_ecdsa_mp_dkg_ac(
+            job.as_raw(),
+            bindings::cbmpc_curve_id_e_CBMPC_CURVE_SECP256K1,
+            empty_sid.as_raw(),
+            access_structure.as_raw(),
+            quorum.as_ptr(),
+            quorum.count()?,
+            out_key.as_mut_ptr(),
+            out_sid.as_mut_ptr(),
+        )
+    };
+    let key = out_key.into_result(code)?;
+    let sid = out_sid.into_result(code)?;
+    Ok((key.to_vec(), sid.to_vec()))
+}
+
+/// Run one party's threshold ECDSA refresh call.
+pub fn ecdsa_mp_refresh_threshold(
+    self_index: usize,
+    party_names: &[String],
+    threshold: usize,
+    quorum_party_names: &[String],
+    sid: &[u8],
+    key_blob: &[u8],
+    transport: &dyn Transport,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let job = MpJob::new(self_index, party_names, transport)?;
+    let access_structure = ThresholdAccessStructure::new(threshold, party_names)?;
+    let quorum = CNames::new(quorum_party_names)?;
+    let sid = BorrowedCmem::new(sid)?;
+    let key_blob = BorrowedCmem::new(key_blob)?;
+    let mut out_sid = OutCmem::new();
+    let mut out_key = OutCmem::new();
+    let code = unsafe {
+        bindings::cbmpc_ecdsa_mp_refresh_ac(
+            job.as_raw(),
+            sid.as_raw(),
+            key_blob.as_raw(),
+            access_structure.as_raw(),
+            quorum.as_ptr(),
+            quorum.count()?,
+            out_sid.as_mut_ptr(),
+            out_key.as_mut_ptr(),
+        )
+    };
+    let new_sid = out_sid.into_result(code)?;
+    let new_key = out_key.into_result(code)?;
+    Ok((new_key.to_vec(), new_sid.to_vec()))
+}
+
+/// Run one online party's threshold ECDSA signing call.
+pub fn ecdsa_mp_sign_threshold(
+    self_index: usize,
+    online_party_names: &[String],
+    policy_party_names: &[String],
+    threshold: usize,
+    key_blob: &[u8],
+    message_hash: &[u8],
+    signature_receiver: usize,
+    transport: &dyn Transport,
+) -> Result<Vec<u8>, Error> {
+    let job = MpJob::new(self_index, online_party_names, transport)?;
+    if signature_receiver >= online_party_names.len() {
+        return Err(Error::InvalidArgument);
+    }
+    let access_structure = ThresholdAccessStructure::new(threshold, policy_party_names)?;
+    let key_blob = BorrowedCmem::new(key_blob)?;
+    let message_hash = BorrowedCmem::new(message_hash)?;
+    let mut out_signature = OutCmem::new();
+    let code = unsafe {
+        bindings::cbmpc_ecdsa_mp_sign_ac(
+            job.as_raw(),
+            key_blob.as_raw(),
+            access_structure.as_raw(),
+            message_hash.as_raw(),
+            i32::try_from(signature_receiver).map_err(|_| Error::InputTooLarge)?,
+            out_signature.as_mut_ptr(),
+        )
+    };
+    Ok(out_signature.into_result(code)?.to_vec())
+}
+
+fn single_output(operation: impl FnOnce(*mut RawCmem) -> i32) -> Result<Vec<u8>, Error> {
+    let mut output = OutCmem::new();
+    let code = operation(output.as_mut_ptr());
+    Ok(output.into_result(code)?.to_vec())
+}
+
+pub fn ecdsa_mp_public_key_compressed(key_blob: &[u8]) -> Result<Vec<u8>, Error> {
+    let key_blob = BorrowedCmem::new(key_blob)?;
+    single_output(|output| unsafe {
+        bindings::cbmpc_ecdsa_mp_get_public_key_compressed(key_blob.as_raw(), output)
+    })
+}
+
+pub fn ecdsa_mp_public_share_compressed(key_blob: &[u8]) -> Result<Vec<u8>, Error> {
+    let key_blob = BorrowedCmem::new(key_blob)?;
+    single_output(|output| unsafe {
+        bindings::cbmpc_ecdsa_mp_get_public_share_compressed(key_blob.as_raw(), output)
+    })
+}
+
+pub fn ecdsa_mp_detach_private_scalar(key_blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let key_blob = BorrowedCmem::new(key_blob)?;
+    let mut out_public_blob = OutCmem::new();
+    let mut out_private_scalar = OutCmem::new();
+    let code = unsafe {
+        bindings::cbmpc_ecdsa_mp_detach_private_scalar(
+            key_blob.as_raw(),
+            out_public_blob.as_mut_ptr(),
+            out_private_scalar.as_mut_ptr(),
+        )
+    };
+    let public_blob = out_public_blob.into_result(code)?;
+    let private_scalar = out_private_scalar.into_result(code)?;
+    Ok((public_blob.to_vec(), private_scalar.to_vec()))
+}
+
+pub fn ecdsa_mp_attach_private_scalar(
+    public_key_blob: &[u8],
+    private_scalar: &[u8],
+    public_share_compressed: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let public_key_blob = BorrowedCmem::new(public_key_blob)?;
+    let private_scalar = BorrowedCmem::new(private_scalar)?;
+    let public_share_compressed = BorrowedCmem::new(public_share_compressed)?;
+    single_output(|output| unsafe {
+        bindings::cbmpc_ecdsa_mp_attach_private_scalar(
+            public_key_blob.as_raw(),
+            private_scalar.as_raw(),
+            public_share_compressed.as_raw(),
+            output,
+        )
+    })
+}
+
 /// A C input view that cannot outlive its Rust backing slice.
 pub struct BorrowedCmem<'a> {
     raw: RawCmem,
